@@ -17,6 +17,10 @@ The solution file can be built in Visual Studio 2008 or higher. Note: the CURL e
 1. Close all IE browser windows.
 2. Run `install.cmd` (BHO files will be placed in `%ProgramFiles%\IESSLHelper\`)
 
+## Usage
+
+Once installed, HTTPS sites can be navigated to in the same way as other sites within IE.
+
 ## Uninstallation
 
 1. Run `uninstall.cmd`.
