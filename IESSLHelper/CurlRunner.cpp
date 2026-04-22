@@ -65,7 +65,18 @@ DWORD RunCurl(const CurlRequest& req)
     // compressed bytes to the output file, MIME sniffing fails (the body
     // looks like application/x-gzip), and IE shows the download dialog
     // instead of rendering the page.
-    int cch = wsprintfW(szCmd, L"\"%s\" -L --ssl-no-revoke --compressed -sS", szCurl);
+    // --connect-timeout bounds how long we'll wait for an unreachable
+    // host; there's no overall --max-time so big downloads can take as
+    // long as they need.
+    int cch = wsprintfW(szCmd,
+        L"\"%s\" -L --ssl-no-revoke --compressed -sS --connect-timeout 30",
+        szCurl);
+
+    // Dump response headers to a file so the caller can see the real
+    // Content-Type and Content-Disposition the server sent, instead of
+    // guessing from URL extension or URLMon's MIME sniffer.
+    if (req.pszHeaderFile && req.pszHeaderFile[0])
+        cch += wsprintfW(szCmd + cch, L" -D \"%s\"", req.pszHeaderFile);
 
     // Verb (-X POST / -X PUT / etc.)
     const bool bCustomVerb = VerbIsAlpha(req.pszVerb) &&
@@ -111,9 +122,8 @@ DWORD RunCurl(const CurlRequest& req)
     if (bHasBody)
         cch += wsprintfW(szCmd + cch, L" --data-binary \"@%s\"", szPipeName);
 
-    // Output file and URL
-    wsprintfW(szCmd + cch, L" -o \"%s\" \"%s\"",
-              req.pszOutFile, req.pszURL);
+    // URL  (stdout is our pipe; no -o flag needed)
+    wsprintfW(szCmd + cch, L" \"%s\"", req.pszURL);
 
     // -----------------------------------------------------------------------
     //  Launch curl
@@ -123,9 +133,24 @@ DWORD RunCurl(const CurlRequest& req)
         GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         &sa, OPEN_EXISTING, 0, NULL));
-    ScopedHandle hErr(CreateFileW(req.pszStderrFile,
-        GENERIC_WRITE, FILE_SHARE_READ,
-        &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
+
+    // Anonymous pipe for stdout.  Write end is inheritable (curl writes to it);
+    // read end is non-inheritable (only we drain it after launching curl).
+    HANDLE hOutReadRaw = INVALID_HANDLE_VALUE, hOutWriteRaw = INVALID_HANDLE_VALUE;
+    CreatePipe(&hOutReadRaw, &hOutWriteRaw, &sa, 0);
+    ScopedHandle hOutRead(hOutReadRaw);
+    ScopedHandle hOutWrite(hOutWriteRaw);
+    if (hOutRead.Valid())
+        SetHandleInformation(hOutRead.Get(), HANDLE_FLAG_INHERIT, 0);
+
+    // Anonymous pipe for stderr.  Write end is inheritable (curl writes to it);
+    // read end is non-inheritable (only we read it after curl exits).
+    HANDLE hErrReadRaw = INVALID_HANDLE_VALUE, hErrWriteRaw = INVALID_HANDLE_VALUE;
+    CreatePipe(&hErrReadRaw, &hErrWriteRaw, &sa, 0);
+    ScopedHandle hErrRead(hErrReadRaw);
+    ScopedHandle hErrWrite(hErrWriteRaw);
+    if (hErrRead.Valid())
+        SetHandleInformation(hErrRead.Get(), HANDLE_FLAG_INHERIT, 0);
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
@@ -133,13 +158,13 @@ DWORD RunCurl(const CurlRequest& req)
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
-    const BOOL bRedirect = hNul.Valid() && hErr.Valid();
+    const BOOL bRedirect = hNul.Valid() && hOutWrite.Valid() && hErrWrite.Valid();
     if (bRedirect)
     {
         si.dwFlags   |= STARTF_USESTDHANDLES;
         si.hStdInput  = hNul.Get();
-        si.hStdOutput = hNul.Get();
-        si.hStdError  = hErr.Get();
+        si.hStdOutput = hOutWrite.Get();
+        si.hStdError  = hErrWrite.Get();
     }
 
     PROCESS_INFORMATION pi;
@@ -148,7 +173,8 @@ DWORD RunCurl(const CurlRequest& req)
                               bRedirect ? TRUE : FALSE,
                               CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     hNul.Close();
-    hErr.Close();
+    hOutWrite.Close(); // close our write ends so pipes signal EOF when curl exits
+    hErrWrite.Close();
 
     if (!bOk)
     {
@@ -184,7 +210,7 @@ DWORD RunCurl(const CurlRequest& req)
                     // Wait for curl to open the pipe or for the process to die.
                     HANDLE waitOn[2] = { hEvent, pi.hProcess };
                     DWORD dw = WaitForMultipleObjects(2, waitOn, FALSE,
-                                                     kCurlTimeoutMs);
+                                                     INFINITE);
                     if (dw == WAIT_OBJECT_0)
                     {
                         DWORD transferred = 0;
@@ -212,19 +238,76 @@ DWORD RunCurl(const CurlRequest& req)
     }
 
     // -----------------------------------------------------------------------
-    //  Wait for curl to finish.
+    //  Drain stdout before waiting: curl may block on a full pipe buffer,
+    //  which would prevent it from ever exiting.  We read until EOF (write
+    //  end closed above), then wait — curl should already be done by then.
+    //
+    //  Small responses (<= kSpillThreshold) accumulate in pStdoutOut.
+    //  Once the threshold is crossed we open pszSpillFile and write
+    //  everything there instead — no memory cap, no curl error 23.
     // -----------------------------------------------------------------------
-    DWORD dwExit = 1;
-    if (WaitForSingleObject(pi.hProcess, kCurlTimeoutMs) == WAIT_OBJECT_0)
-        GetExitCodeProcess(pi.hProcess, &dwExit);
-    else
+    if (req.pStdoutOut && hOutRead.Valid())
     {
-        TerminateProcess(pi.hProcess, 1);
-        dwExit = FETCH_TIMED_OUT;
+        req.pStdoutOut->Free();
+        if (req.pDidSpill) *req.pDidSpill = false;
+
+        HANDLE hSpill = INVALID_HANDLE_VALUE;
+        BYTE   buf[65536];
+        DWORD  cbRead = 0;
+        while (ReadFile(hOutRead.Get(), buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
+        {
+            // Switch to spill file once threshold is exceeded.
+            if (hSpill == INVALID_HANDLE_VALUE &&
+                req.pszSpillFile &&
+                req.pStdoutOut->size + cbRead > kSpillThreshold)
+            {
+                hSpill = CreateFileW(req.pszSpillFile, GENERIC_WRITE, 0, NULL,
+                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (hSpill != INVALID_HANDLE_VALUE)
+                {
+                    // Flush already-buffered bytes to file first.
+                    DWORD cbWritten = 0;
+                    WriteFile(hSpill, req.pStdoutOut->data, req.pStdoutOut->size,
+                              &cbWritten, NULL);
+                    req.pStdoutOut->Free();
+                    if (req.pDidSpill) *req.pDidSpill = true;
+                }
+            }
+
+            if (hSpill != INVALID_HANDLE_VALUE)
+            {
+                DWORD cbWritten = 0;
+                WriteFile(hSpill, buf, cbRead, &cbWritten, NULL);
+            }
+            else
+            {
+                req.pStdoutOut->Append(buf, cbRead);
+            }
+        }
+
+        if (hSpill != INVALID_HANDLE_VALUE)
+            CloseHandle(hSpill);
+        hOutRead.Close();
     }
+
+    DWORD dwExit = 1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    GetExitCodeProcess(pi.hProcess, &dwExit);
 
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+
+    // Drain the stderr pipe into the caller's buffer.
+    // Curl has exited by now so the amount is small and bounded.
+    if (req.pStderrOut && hErrRead.Valid())
+    {
+        req.pStderrOut->Free();
+        BYTE buf[4096];
+        DWORD cbRead = 0;
+        while (ReadFile(hErrRead.Get(), buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
+            req.pStderrOut->Append(buf, cbRead);
+    }
+
     return dwExit;
 }
 

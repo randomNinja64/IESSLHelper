@@ -1,28 +1,33 @@
 #pragma once
 #include "stdafx.h"
+#include "Util.h"
 
 // ---------------------------------------------------------------------------
 // CurlRunner - launches curl.exe to perform a single HTTP(S) request.
-// All output goes to caller-provided files (response body and stderr);
-// no parsing or buffering is done here.
+// Response body is piped into pStdoutOut (in memory) for small responses;
+// once kSpillThreshold is exceeded it spills into pszSpillFile instead.
+// Stderr is always captured via a pipe into pStderrOut.
 // ---------------------------------------------------------------------------
 
 namespace curlbho {
 
-// Pseudo exit codes returned in addition to whatever curl itself returns.
-// (defined in the header so they can be used as case labels in other TUs)
+// Pseudo exit code returned when curl.exe could not even be launched.
+// (defined in the header so it can be used as a case label in other TUs)
 static const DWORD FETCH_LAUNCH_FAILED = 0xFFFFFFFE;
-static const DWORD FETCH_TIMED_OUT     = 0xFFFFFFFD;
 
-// How long we will wait for curl to complete (also bounds the pipe wait).
-static const DWORD kCurlTimeoutMs      = 30000;
+// Responses smaller than this stay in pStdoutOut (in memory).
+// Larger responses spill to pszSpillFile so downloads don't hit a cap.
+static const DWORD kSpillThreshold = 16777216; // 16 MiB
 
 // Parameters passed to RunCurl.
 struct CurlRequest
 {
     LPCWSTR     pszURL;
-    LPCWSTR     pszOutFile;
-    LPCWSTR     pszStderrFile;
+    Bytes*      pStdoutOut;       // receives body when response <= kSpillThreshold
+    LPCWSTR     pszSpillFile;     // if non-NULL, large responses are written here instead
+    bool*       pDidSpill;        // out: set to true if pszSpillFile was used
+    Bytes*      pStderrOut;       // receives stderr bytes; may be NULL
+    LPCWSTR     pszHeaderFile;    // if non-NULL, response headers are dumped here (-D)
     LPCWSTR     pszVerb;          // NULL / empty -> GET
     LPCWSTR     pszContentType;   // NULL -> not forwarded
     LPCWSTR     pszExtraHeaders;  // NULL or \r\n-delimited extra headers
@@ -30,7 +35,7 @@ struct CurlRequest
     DWORD       cbPostData;
 };
 
-// Returns the curl process exit code, or FETCH_LAUNCH_FAILED / FETCH_TIMED_OUT.
+// Returns the curl process exit code, or FETCH_LAUNCH_FAILED.
 DWORD RunCurl(const CurlRequest& req);
 
 } // namespace curlbho

@@ -1,7 +1,6 @@
-
-Microsoft Visual Studio Solution File, Format Version 11.00
-# Visual Studio 2010
-Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "IESSLHelper", "IESSLHelper\IESSLHelper.vcxproj", "{D4BD770E-8A07-49D3-9886-015D0CE4A808}"
+Microsoft Visual Studio Solution File, Format Version 10.00
+# Visual Studio 2008
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "IESSLHelper", "IESSLHelper\IESSLHelper.vcproj", "{9D78E00A-B605-4F34-BCBB-9AB3EDDC0D35}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -9,10 +8,10 @@ Global
 		Release|Win32 = Release|Win32
 	EndGlobalSection
 	GlobalSection(ProjectConfigurationPlatforms) = postSolution
-		{D4BD770E-8A07-49D3-9886-015D0CE4A808}.Debug|Win32.ActiveCfg = Debug|Win32
-		{D4BD770E-8A07-49D3-9886-015D0CE4A808}.Debug|Win32.Build.0 = Debug|Win32
-		{D4BD770E-8A07-49D3-9886-015D0CE4A808}.Release|Win32.ActiveCfg = Release|Win32
-		{D4BD770E-8A07-49D3-9886-015D0CE4A808}.Release|Win32.Build.0 = Release|Win32
+		{9D78E00A-B605-4F34-BCBB-9AB3EDDC0D35}.Debug|Win32.ActiveCfg = Debug|Win32
+		{9D78E00A-B605-4F34-BCBB-9AB3EDDC0D35}.Debug|Win32.Build.0 = Debug|Win32
+		{9D78E00A-B605-4F34-BCBB-9AB3EDDC0D35}.Release|Win32.ActiveCfg = Release|Win32
+		{9D78E00A-B605-4F34-BCBB-9AB3EDDC0D35}.Release|Win32.Build.0 = Release|Win32
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

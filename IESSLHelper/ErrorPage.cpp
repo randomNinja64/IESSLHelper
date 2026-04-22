@@ -1,6 +1,6 @@
 #include "stdafx.h"
 #include "ErrorPage.h"
-#include "CurlRunner.h"   // FETCH_LAUNCH_FAILED, FETCH_TIMED_OUT
+#include "CurlRunner.h"   // FETCH_LAUNCH_FAILED
 
 namespace curlbho {
 
@@ -67,9 +67,6 @@ void BuildErrorPage(Bytes& out, LPCWSTR pszURL, DWORD dwExit,
         case FETCH_LAUNCH_FAILED:
             pszMsg = L"Failed to launch curl.exe. Make sure it exists next to "
                      L"the BHO DLL or is on PATH.";
-            break;
-        case FETCH_TIMED_OUT:
-            pszMsg = L"curl did not finish within the 30-second timeout.";
             break;
         default:
             wsprintfW(szMsg,

@@ -7,9 +7,6 @@
 
 namespace curlbho {
 
-// Maximum response size we are willing to load into memory.
-extern const DWORD kMaxResponseBytes;   // 64 MiB
-
 // ---------------------------------------------------------------------------
 // ScopedHandle - RAII for Win32 HANDLEs.
 // ---------------------------------------------------------------------------
@@ -22,6 +19,7 @@ public:
     HANDLE Get()   const { return m_h; }
     bool   Valid() const { return m_h != NULL && m_h != INVALID_HANDLE_VALUE; }
     void   Close() { if (Valid()) CloseHandle(m_h); m_h = INVALID_HANDLE_VALUE; }
+    void   Attach(HANDLE h) { Close(); m_h = h; }
 
 private:
     HANDLE m_h;
@@ -31,13 +29,17 @@ private:
 
 // ---------------------------------------------------------------------------
 // Bytes - tiny owning byte buffer (LocalAlloc / LocalFree).
+// Uses geometric capacity growth so repeated Append() calls are amortized
+// O(1); a 16 MiB body assembled from 64 KiB chunks does ~9 reallocations
+// instead of ~256.
 // ---------------------------------------------------------------------------
 struct Bytes
 {
     BYTE*  data;
     DWORD  size;
+    DWORD  capacity;
 
-    Bytes() : data(NULL), size(0) {}
+    Bytes() : data(NULL), size(0), capacity(0) {}
     ~Bytes() { Free(); }
 
     void Free()
@@ -45,26 +47,35 @@ struct Bytes
         if (data) LocalFree(data);
         data = NULL;
         size = 0;
+        capacity = 0;
     }
 
-    bool Reserve(DWORD n)
-    {
-        Free();
-        data = (BYTE*)LocalAlloc(LMEM_FIXED, n ? n : 1);
-        size = data ? n : 0;
-        return data != NULL;
-    }
-
-    // Append n bytes, growing the buffer.
+    // Append n bytes, growing the buffer geometrically.
     bool Append(const void* src, DWORD n)
     {
         if (!n) return true;
-        BYTE* nb = (BYTE*)LocalAlloc(LMEM_FIXED, size + n);
-        if (!nb) return false;
-        if (data) memcpy(nb, data, size);
-        memcpy(nb + size, src, n);
-        if (data) LocalFree(data);
-        data = nb;
+        DWORD need = size + n;
+        if (need < size) return false; // overflow
+        if (need > capacity)
+        {
+            DWORD cap = capacity ? capacity : 64;
+            while (cap < need)
+            {
+                DWORD next = cap * 2;
+                if (next < cap) { cap = need; break; } // overflow -> exact
+                cap = next;
+            }
+            BYTE* nb = (BYTE*)LocalAlloc(LMEM_FIXED, cap);
+            if (!nb) return false;
+            if (data)
+            {
+                memcpy(nb, data, size);
+                LocalFree(data);
+            }
+            data = nb;
+            capacity = cap;
+        }
+        memcpy(data + size, src, n);
         size += n;
         return true;
     }
@@ -75,8 +86,5 @@ private:
     Bytes(const Bytes&);
     Bytes& operator=(const Bytes&);
 };
-
-// Read an entire file into out, capped at kMaxResponseBytes.
-bool ReadAllBytes(LPCWSTR pszPath, Bytes& out);
 
 } // namespace curlbho
