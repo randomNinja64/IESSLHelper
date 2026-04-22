@@ -186,25 +186,6 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
 
     dwExit = curlbho::RunCurl(req);
 
-    // If an http:// fetch failed, transparently retry over https://.
-    // Many sites that used to serve plain HTTP now redirect or only
-    // accept TLS, but legacy IE/WinInet can't complete the handshake;
-    // curl can, so this gives the user a working page either way.
-    if (dwExit != 0 && self->m_url &&
-        (self->m_url[0] == L'h' || self->m_url[0] == L'H') &&
-        _wcsnicmp(self->m_url, L"http://", 7) == 0)
-    {
-        CComBSTR upgraded(L"https://");
-        upgraded += (BSTR)(self->m_url + 7);
-        if (didSpill) { DeleteFileW(szOut); didSpill = false; }
-        self->m_body.Free();
-        if (szHdr[0]) DeleteFileW(szHdr);
-        req.pszURL = upgraded;
-        DWORD dwExit2 = curlbho::RunCurl(req);
-        if (dwExit2 == 0)
-            dwExit = 0; // success on retry
-    }
-
     if (dwExit == 0)
     {
         if (didSpill)
@@ -864,14 +845,6 @@ HRESULT RegisterCurlProtocol()
         hr = spSession->RegisterNameSpace(&g_factory, CLSID_CurlProtocol,
                                           L"https", 0, NULL, 0);
     }
-    if (SUCCEEDED(hr))
-    {
-        // Also intercept http:// so we can fall back to https when an
-        // http fetch fails (many legacy sites now require TLS).
-        HRESULT hr2 = spSession->RegisterNameSpace(&g_factory, CLSID_CurlProtocol,
-                                                   L"http", 0, NULL, 0);
-        (void)hr2; // non-fatal if http registration fails
-    }
     if (FAILED(hr))
         InterlockedDecrement(&g_registerCount);
     return hr;
@@ -886,7 +859,6 @@ HRESULT UnregisterCurlProtocol()
     HRESULT hr = CoInternetGetSession(0, &spSession, 0);
     if (SUCCEEDED(hr))
     {
-        spSession->UnregisterNameSpace(&g_factory, L"http");
         hr = spSession->UnregisterNameSpace(&g_factory, L"https");
     }
     return hr;
