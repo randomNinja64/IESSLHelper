@@ -3,6 +3,7 @@
 #include "CurlRunner.h"
 #include "ErrorPage.h"
 #include "Util.h"
+#include <wininet.h>
 
 // ===========================================================================
 //  CurlProtocol
@@ -53,6 +54,81 @@ static const char* MatchHdr(const char* lineStart, DWORD lineLen,
     return v;
 }
 
+// Netscape cookie lines for the cookies WinInet would send for pszURL.
+// curl reads these from a named pipe, so nothing is written to disk.
+// Empty when there are none.
+static void BuildCookieJar(LPCWSTR pszURL, Bytes& out)
+{
+    out.Free();
+    WCHAR szHost[INTERNET_MAX_HOST_NAME_LENGTH + 1];
+    DWORD cchHost = _countof(szHost);
+    if (FAILED(UrlGetPartW(pszURL, szHost, &cchHost, URL_PART_HOSTNAME, 0)) || !szHost[0])
+        return;
+    char szHostA[INTERNET_MAX_HOST_NAME_LENGTH * 3 + 1];
+    if (!WideCharToMultiByte(CP_ACP, 0, szHost, -1, szHostA, sizeof(szHostA), NULL, NULL))
+        return;
+
+    DWORD cch = 0;
+    if (!InternetGetCookieW(pszURL, NULL, NULL, &cch) || cch == 0)
+        return;
+    WCHAR* pszCookies = (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR));
+    if (!pszCookies)
+        return;
+    if (!InternetGetCookieW(pszURL, NULL, pszCookies, &cch))
+        cch = 0;
+    pszCookies[cch] = 0;
+
+    for (WCHAR* p = pszCookies; *p; )
+    {
+        while (*p == L' ' || *p == L';') ++p;
+        WCHAR* pEnd = p;
+        while (*pEnd && *pEnd != L';') ++pEnd;
+        WCHAR* pNext = *pEnd ? pEnd + 1 : pEnd;
+        *pEnd = 0;
+        while (pEnd > p && pEnd[-1] == L' ') *--pEnd = 0;
+
+        bool ok = *p != 0;
+        for (WCHAR* q = p; *q && ok; ++q)
+            if (*q == L'\t' || *q == L'\r' || *q == L'\n') ok = false;
+        if (ok)
+        {
+            WCHAR* pEq = wcschr(p, L'=');
+            LPCWSTR pszValue = L"";
+            if (pEq) { *pEq = 0; pszValue = pEq + 1; }
+
+            int cchName  = WideCharToMultiByte(CP_ACP, 0, p, -1, NULL, 0, NULL, NULL);
+            int cchValue = WideCharToMultiByte(CP_ACP, 0, pszValue, -1, NULL, 0, NULL, NULL);
+            char* pszLine = (char*)LocalAlloc(LMEM_FIXED, lstrlenA(szHostA) + cchName + cchValue + 32);
+            if (pszLine)
+            {
+                int n = wsprintfA(pszLine, "%s\tFALSE\t/\tFALSE\t0\t", szHostA);
+                n += WideCharToMultiByte(CP_ACP, 0, p, -1, pszLine + n, cchName, NULL, NULL) - 1;
+                pszLine[n++] = '\t';
+                n += WideCharToMultiByte(CP_ACP, 0, pszValue, -1, pszLine + n, cchValue, NULL, NULL) - 1;
+                pszLine[n++] = '\n';
+                out.Append(pszLine, (DWORD)n);
+                LocalFree(pszLine);
+            }
+        }
+        p = pNext;
+    }
+    LocalFree(pszCookies);
+}
+
+// Stores one Set-Cookie header value in WinInet for pszURL.
+static void StoreSetCookie(LPCWSTR pszURL, const char* v, DWORD vlen)
+{
+    if (!vlen) return;
+    int cch = MultiByteToWideChar(CP_ACP, 0, v, (int)vlen, NULL, 0);
+    if (cch <= 0) return;
+    WCHAR* psz = (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR));
+    if (!psz) return;
+    MultiByteToWideChar(CP_ACP, 0, v, (int)vlen, psz, cch);
+    psz[cch] = 0;
+    InternetSetCookieW(pszURL, NULL, psz);
+    LocalFree(psz);
+}
+
 // ---------------------------------------------------------------------------
 //  CurlProtocol - the IInternetProtocol implementation.
 // ---------------------------------------------------------------------------
@@ -69,7 +145,7 @@ public:
     END_COM_MAP()
 
     CurlProtocol() : m_pos(0), m_isError(false), m_bodyFileSize(0),
-                     m_isAttachment(false)
+                     m_isAttachment(false), m_status(200)
     {
         m_szBodyFile[0]   = 0;
         m_szHeaderFile[0] = 0;
@@ -143,6 +219,7 @@ private:
     CComBSTR                       m_contentDisposition;    // from Content-Disposition:
     CComBSTR                       m_dispositionFilename;   // filename= / filename*= value
     bool                           m_isAttachment;          // CD says "attachment"
+    DWORD                          m_status;                // final HTTP status code
 };
 
 DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
@@ -168,6 +245,8 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             lstrcpynW(szHdr, szBase, MAX_PATH); lstrcatW(szHdr, L".hdr");
         }
     }
+    Bytes cookieJar;
+    BuildCookieJar(self->m_url, cookieJar);
 
     bool didSpill = false;
     CurlRequest req;
@@ -178,6 +257,8 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     req.pDidSpill       = &didSpill;
     req.pStderrOut      = &stderrBytes;
     req.pszHeaderFile   = szHdr[0] ? szHdr : NULL;
+    req.pCookieJar      = cookieJar.size ? cookieJar.data : NULL;
+    req.cbCookieJar     = cookieJar.size;
     req.pszVerb         = self->m_verb.Length()         > 0 ? (LPCWSTR)self->m_verb         : NULL;
     req.pszContentType  = self->m_contentType.Length()  > 0 ? (LPCWSTR)self->m_contentType  : NULL;
     req.pszExtraHeaders = self->m_extraHeaders.Length() > 0 ? (LPCWSTR)self->m_extraHeaders : NULL;
@@ -225,8 +306,9 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     // Parse the response headers (Content-Type / Content-Disposition) so
     // Continue() can use the server's authoritative values instead of
     // guessing from URL extensions or sniffed bytes.  Only the *last*
-    // response block in the file matters (curl writes one block per hop
-    // when -L follows redirects).
+    // response block in the file matters (a POST may be preceded by an
+    // interim "100 Continue" block).
+    WCHAR szLocation[INTERNET_MAX_URL_LENGTH] = L"";
     if (!self->m_isError && szHdr[0])
     {
         HANDLE hH = CreateFileW(szHdr, GENERIC_READ,
@@ -242,7 +324,7 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             CloseHandle(hH);
 
             // Find the start of the *final* HTTP/ status line so we ignore
-            // any 3xx headers from earlier hops in a redirect chain.
+            // any interim 1xx blocks.
             const char* pAll = (const char*)hdrs.data;
             DWORD       cb   = hdrs.size;
             const char* pStart = pAll;
@@ -265,7 +347,27 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
                     ++lineEnd;
                 DWORD lineLen = (DWORD)(lineEnd - p);
 
-                if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
+                if (p == pStart && lineLen > 5 && _strnicmp(p, "HTTP/", 5) == 0)
+                {
+                    const char* s = p + 5;
+                    while (s < lineEnd && *s != ' ') ++s;
+                    while (s < lineEnd && *s == ' ') ++s;
+                    DWORD code = 0;
+                    while (s < lineEnd && *s >= '0' && *s <= '9')
+                        code = code * 10 + (DWORD)(*s++ - '0');
+                    if (code) self->m_status = code;
+                }
+                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10))
+                {
+                    StoreSetCookie(self->m_url, v, (DWORD)(lineEnd - v));
+                }
+                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Location", 8))
+                {
+                    int wlen = MultiByteToWideChar(CP_UTF8, 0, v, (int)(lineEnd - v),
+                                                  szLocation, _countof(szLocation) - 1);
+                    szLocation[wlen > 0 ? wlen : 0] = 0;
+                }
+                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
                 {
                     DWORD vlen = (DWORD)(lineEnd - v);
                     // Strip any "; charset=..." parameters for the MIME.
@@ -349,6 +451,26 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     }
     if (szHdr[0]) DeleteFileW(szHdr);
 
+    // Redirects are followed by URLMon, not curl, so each hop's Set-Cookie
+    // reaches WinInet before the next request reads it.  These are the
+    // codes IE6 follows.
+    const DWORD st = self->m_status;
+    if (!self->m_isError && szLocation[0] &&
+        (st == 301 || st == 302 || st == 303 || st == 307))
+    {
+        WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
+        DWORD cchTarget = _countof(szTarget);
+        CComPtr<IInternetProtocolSink> sink = self->m_sink;
+        if (sink && SUCCEEDED(UrlCombineW(self->m_url, szLocation,
+                                          szTarget, &cchTarget, 0)))
+        {
+            sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
+            sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
+            self->Release();      // matches AddRef in Start
+            return 0;
+        }
+    }
+
     // Hand control back to the apartment thread.
     PROTOCOLDATA pd;
     ZeroMemory(&pd, sizeof(pd));
@@ -380,6 +502,7 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     m_contentDisposition.Empty();
     m_dispositionFilename.Empty();
     m_isAttachment = false;
+    m_status       = 200;
     CloseAndDeleteBodyFile();
     DeleteHeaderFile();
     m_bodyFileSize = 0;
@@ -748,7 +871,7 @@ STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
                        cbTotal, cbTotal);
 
     // 3. Mark the bind as complete.
-    m_sink->ReportResult(S_OK, 200, NULL);
+    m_sink->ReportResult(S_OK, m_status, NULL);
     return S_OK;
 }
 

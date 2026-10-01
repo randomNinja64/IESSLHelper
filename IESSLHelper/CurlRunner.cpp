@@ -16,6 +16,53 @@ static bool VerbIsAlpha(LPCWSTR psz)
     return true;
 }
 
+// Block until curl opens hPipe (or exits), write data, then close the pipe
+// so the reader sees EOF.  The pipe lives only in memory.
+static void ServePipe(HANDLE hPipe, HANDLE hProcess, const void* data, DWORD cb)
+{
+    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (hEvent)
+    {
+        OVERLAPPED ov;
+        ZeroMemory(&ov, sizeof(ov));
+        ov.hEvent = hEvent;
+
+        BOOL bConnected = ConnectNamedPipe(hPipe, &ov);
+        DWORD dwPipeErr = GetLastError();
+
+        if (!bConnected)
+        {
+            if (dwPipeErr == ERROR_PIPE_CONNECTED)
+            {
+                bConnected = TRUE;
+            }
+            else if (dwPipeErr == ERROR_IO_PENDING)
+            {
+                HANDLE waitOn[2] = { hEvent, hProcess };
+                DWORD dw = WaitForMultipleObjects(2, waitOn, FALSE, INFINITE);
+                if (dw == WAIT_OBJECT_0)
+                {
+                    DWORD transferred = 0;
+                    bConnected = GetOverlappedResult(hPipe, &ov, &transferred, FALSE);
+                }
+                else
+                {
+                    CancelIo(hPipe);
+                }
+            }
+        }
+
+        CloseHandle(hEvent);
+
+        if (bConnected && data && cb)
+        {
+            DWORD cbWritten = 0;
+            WriteFile(hPipe, data, cb, &cbWritten, NULL);
+        }
+    }
+    CloseHandle(hPipe);
+}
+
 DWORD RunCurl(const CurlRequest& req)
 {
     WCHAR szCurl[MAX_PATH];
@@ -31,11 +78,32 @@ DWORD RunCurl(const CurlRequest& req)
     // -----------------------------------------------------------------------
     WCHAR  szPipeName[96] = L"";
     HANDLE hPipe          = INVALID_HANDLE_VALUE;
+    WCHAR  szCookiePipe[96] = L"";
+    HANDLE hCookiePipe      = INVALID_HANDLE_VALUE;
 
+    static LONG s_seq = 0;
     const bool bHasBody = (req.pPostData != NULL && req.cbPostData > 0);
+    const bool bHasCookies = (req.pCookieJar != NULL && req.cbCookieJar > 0);
+
+    if (bHasCookies)
+    {
+        LONG seq = InterlockedIncrement(&s_seq);
+        wsprintfW(szCookiePipe,
+            L"\\\\.\\pipe\\curlbho_ck_%08X_%08X",
+            GetCurrentProcessId(), (DWORD)seq);
+
+        hCookiePipe = CreateNamedPipeW(
+            szCookiePipe,
+            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            1, 0, req.cbCookieJar + 1, 0, NULL);
+
+        if (hCookiePipe == INVALID_HANDLE_VALUE)
+            return FETCH_LAUNCH_FAILED;
+    }
+
     if (bHasBody)
     {
-        static LONG s_seq = 0;
         LONG seq = InterlockedIncrement(&s_seq);
         wsprintfW(szPipeName,
             L"\\\\.\\pipe\\curlbho_%08X_%08X",
@@ -52,7 +120,10 @@ DWORD RunCurl(const CurlRequest& req)
             NULL);
 
         if (hPipe == INVALID_HANDLE_VALUE)
+        {
+            if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
             return FETCH_LAUNCH_FAILED;
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -69,7 +140,7 @@ DWORD RunCurl(const CurlRequest& req)
     // host; there's no overall --max-time so big downloads can take as
     // long as they need.
     int cch = wsprintfW(szCmd,
-        L"\"%s\" -L --ssl-no-revoke --compressed -sS --connect-timeout 30",
+        L"\"%s\" --ssl-no-revoke --compressed -sS --connect-timeout 30",
         szCurl);
 
     // Dump response headers to a file so the caller can see the real
@@ -77,6 +148,19 @@ DWORD RunCurl(const CurlRequest& req)
     // guessing from URL extension or URLMon's MIME sniffer.
     if (req.pszHeaderFile && req.pszHeaderFile[0])
         cch += wsprintfW(szCmd + cch, L" -D \"%s\"", req.pszHeaderFile);
+
+    // No '=' in the pipe path, so curl opens it as a cookie file. The
+    // bytes stay in the pipe's memory buffer; curl reads them at startup.
+    if (bHasCookies)
+    {
+        if (cch + lstrlenW(szCookiePipe) + 8 >= (int)_countof(szCmd))
+        {
+            CloseHandle(hCookiePipe);
+            if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
+            return FETCH_LAUNCH_FAILED;
+        }
+        cch += wsprintfW(szCmd + cch, L" -b \"%s\"", szCookiePipe);
+    }
 
     // Verb (-X POST / -X PUT / etc.)
     const bool bCustomVerb = VerbIsAlpha(req.pszVerb) &&
@@ -103,7 +187,8 @@ DWORD RunCurl(const CurlRequest& req)
             LPCWSTR pEnd = pLine;
             while (*pEnd && *pEnd != L'\r' && *pEnd != L'\n') ++pEnd;
             int len = (int)(pEnd - pLine);
-            if (len > 0 && cch + len + 10 < (int)_countof(szCmd))
+            const bool bCookie = len >= 7 && _wcsnicmp(pLine, L"Cookie:", 7) == 0;
+            if (len > 0 && !bCookie && cch + len + 10 < (int)_countof(szCmd))
             {
                 WCHAR szLine[512];
                 int copyLen = len < (int)_countof(szLine) - 1
@@ -178,64 +263,18 @@ DWORD RunCurl(const CurlRequest& req)
 
     if (!bOk)
     {
+        if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
         return FETCH_LAUNCH_FAILED;
     }
 
-    // -----------------------------------------------------------------------
-    //  Feed POST body through the named pipe.
-    //  Overlapped ConnectNamedPipe lets us also wake up if curl exits before
-    //  it opens the pipe (e.g. it prints an error and dies immediately).
-    // -----------------------------------------------------------------------
+    // Cookie file first: curl reads it at startup, before the request body.
+    if (bHasCookies && hCookiePipe != INVALID_HANDLE_VALUE)
+        ServePipe(hCookiePipe, pi.hProcess, req.pCookieJar, req.cbCookieJar);
+
+    // POST body. Overlapped connect also wakes if curl exits first.
     if (bHasBody && hPipe != INVALID_HANDLE_VALUE)
-    {
-        HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-        if (hEvent)
-        {
-            OVERLAPPED ov;
-            ZeroMemory(&ov, sizeof(ov));
-            ov.hEvent = hEvent;
-
-            BOOL bConnected = ConnectNamedPipe(hPipe, &ov);
-            DWORD dwPipeErr = GetLastError();
-
-            if (!bConnected)
-            {
-                if (dwPipeErr == ERROR_PIPE_CONNECTED)
-                {
-                    bConnected = TRUE;
-                }
-                else if (dwPipeErr == ERROR_IO_PENDING)
-                {
-                    // Wait for curl to open the pipe or for the process to die.
-                    HANDLE waitOn[2] = { hEvent, pi.hProcess };
-                    DWORD dw = WaitForMultipleObjects(2, waitOn, FALSE,
-                                                     INFINITE);
-                    if (dw == WAIT_OBJECT_0)
-                    {
-                        DWORD transferred = 0;
-                        bConnected = GetOverlappedResult(hPipe, &ov,
-                                                        &transferred, FALSE);
-                    }
-                    else
-                    {
-                        CancelIo(hPipe);
-                    }
-                }
-            }
-
-            CloseHandle(hEvent);
-
-            if (bConnected)
-            {
-                DWORD cbWritten = 0;
-                WriteFile(hPipe, req.pPostData, req.cbPostData,
-                          &cbWritten, NULL);
-            }
-        }
-        CloseHandle(hPipe);
-        hPipe = INVALID_HANDLE_VALUE;
-    }
+        ServePipe(hPipe, pi.hProcess, req.pPostData, req.cbPostData);
 
     // -----------------------------------------------------------------------
     //  Drain stdout before waiting: curl may block on a full pipe buffer,

@@ -28,6 +28,8 @@ struct CurlRequest
     bool*       pDidSpill;        // out: set to true if pszSpillFile was used
     Bytes*      pStderrOut;       // receives stderr bytes; may be NULL
     LPCWSTR     pszHeaderFile;    // if non-NULL, response headers are dumped here (-D)
+    const BYTE* pCookieJar;      // if non-NULL, Netscape cookie lines served on a pipe
+    DWORD       cbCookieJar;
     LPCWSTR     pszVerb;          // NULL / empty -> GET
     LPCWSTR     pszContentType;   // NULL -> not forwarded
     LPCWSTR     pszExtraHeaders;  // NULL or \r\n-delimited extra headers
