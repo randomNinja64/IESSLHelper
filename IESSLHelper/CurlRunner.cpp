@@ -151,8 +151,40 @@ static bool AppendHeaderLine(WCHAR* szCmd, int* pcch, LPCWSTR line, int len)
     return true;
 }
 
-DWORD RunCurl(const CurlRequest& req)
+// Stderr kept for the error page.  Reading continues past the cap so the
+// pipe cannot fill and stall curl.
+static const DWORD kStderrKeep = 64 * 1024;
+
+struct StderrArg
 {
+    HANDLE hErr;
+    Bytes* out;
+};
+
+static DWORD WINAPI DrainStderr(LPVOID pv)
+{
+    StderrArg* a = static_cast<StderrArg*>(pv);
+    BYTE buf[4096];
+    DWORD n = 0;
+    while (ReadFile(a->hErr, buf, sizeof(buf), &n, NULL) && n > 0)
+    {
+        DWORD room = (a->out->size < kStderrKeep) ? kStderrKeep - a->out->size : 0;
+        if (room)
+            a->out->Append(buf, n < room ? n : room);
+    }
+    CloseHandle(a->hErr);
+    LocalFree(a);
+    return 0;
+}
+
+bool StartCurl(const CurlRequest& req, CurlProcess* proc)
+{
+    proc->hProcess       = NULL;
+    proc->hOut           = INVALID_HANDLE_VALUE;
+    proc->hErr           = INVALID_HANDLE_VALUE;
+    proc->hStderrThread  = NULL;
+    proc->errBytes.Free();
+
     WCHAR szCurl[MAX_PATH];
     GetModuleFileNameW(g_hModule, szCurl, MAX_PATH);
     PathRemoveFileSpecW(szCurl);
@@ -187,7 +219,7 @@ DWORD RunCurl(const CurlRequest& req)
             1, 0, req.cbCookieJar + 1, 0, NULL);
 
         if (hCookiePipe == INVALID_HANDLE_VALUE)
-            return FETCH_LAUNCH_FAILED;
+            return false;
     }
 
     if (bHasBody)
@@ -210,7 +242,7 @@ DWORD RunCurl(const CurlRequest& req)
         if (hPipe == INVALID_HANDLE_VALUE)
         {
             if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
-            return FETCH_LAUNCH_FAILED;
+            return false;
         }
     }
 
@@ -223,7 +255,7 @@ DWORD RunCurl(const CurlRequest& req)
     {
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        return FETCH_LAUNCH_FAILED;
+        return false;
     }
     int cch = 0;
     szCmd[0] = 0;
@@ -236,15 +268,11 @@ DWORD RunCurl(const CurlRequest& req)
     // --connect-timeout bounds how long we'll wait for an unreachable
     // host; there's no overall --max-time so big downloads can take as
     // long as they need.
+    // -i: response headers come first on stdout, so the caller can act on
+    // them before the body has finished arriving.
     bool bCmd = AppendArg(szCmd, &cch,
-        L"\"%s\" --ssl-no-revoke --compressed -sS --connect-timeout 30",
+        L"\"%s\" -i --ssl-no-revoke --compressed -sS --connect-timeout 30",
         szCurl);
-
-    // Dump response headers to a file so the caller can see the real
-    // Content-Type and Content-Disposition the server sent, instead of
-    // guessing from URL extension or URLMon's MIME sniffer.
-    if (bCmd && req.pszHeaderFile && req.pszHeaderFile[0])
-        bCmd = AppendArg(szCmd, &cch, L" -D \"%s\"", req.pszHeaderFile);
 
     // No '=' in the pipe path, so curl opens it as a cookie file. The
     // bytes stay in the pipe's memory buffer; curl reads them at startup.
@@ -291,7 +319,7 @@ DWORD RunCurl(const CurlRequest& req)
         LocalFree(szCmd);
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        return FETCH_LAUNCH_FAILED;
+        return false;
     }
 
     // -----------------------------------------------------------------------
@@ -313,7 +341,8 @@ DWORD RunCurl(const CurlRequest& req)
         SetHandleInformation(hOutRead.Get(), HANDLE_FLAG_INHERIT, 0);
 
     // Anonymous pipe for stderr.  Write end is inheritable (curl writes to it);
-    // read end is non-inheritable (only we read it after curl exits).
+    // read end is non-inheritable and drained on a side thread while stdout
+    // is read, so a full stderr pipe cannot stall curl.
     HANDLE hErrReadRaw = INVALID_HANDLE_VALUE, hErrWriteRaw = INVALID_HANDLE_VALUE;
     CreatePipe(&hErrReadRaw, &hErrWriteRaw, &sa, 0);
     ScopedHandle hErrRead(hErrReadRaw);
@@ -327,20 +356,20 @@ DWORD RunCurl(const CurlRequest& req)
     si.dwFlags     = STARTF_USESHOWWINDOW;
     si.wShowWindow = SW_HIDE;
 
-    const BOOL bRedirect = hNul.Valid() && hOutWrite.Valid() && hErrWrite.Valid();
-    if (bRedirect)
+    // Without redirected stdio there is no response to read.
+    BOOL bOk = hNul.Valid() && hOutRead.Valid() && hOutWrite.Valid() &&
+               hErrRead.Valid() && hErrWrite.Valid();
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&pi, sizeof(pi));
+    if (bOk)
     {
         si.dwFlags   |= STARTF_USESTDHANDLES;
         si.hStdInput  = hNul.Get();
         si.hStdOutput = hOutWrite.Get();
         si.hStdError  = hErrWrite.Get();
+        bOk = CreateProcessW(NULL, szCmd, NULL, NULL, TRUE,
+                             CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     }
-
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&pi, sizeof(pi));
-    BOOL bOk = CreateProcessW(NULL, szCmd, NULL, NULL,
-                              bRedirect ? TRUE : FALSE,
-                              CREATE_NO_WINDOW, NULL, NULL, &si, &pi);
     LocalFree(szCmd);
     hNul.Close();
     hOutWrite.Close(); // close our write ends so pipes signal EOF when curl exits
@@ -350,7 +379,31 @@ DWORD RunCurl(const CurlRequest& req)
     {
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        return FETCH_LAUNCH_FAILED;
+        return false;
+    }
+    CloseHandle(pi.hThread);
+
+    // Drain stderr before anything else blocks, including the cookie and
+    // POST pipes below.
+    StderrArg* arg = (StderrArg*)LocalAlloc(LMEM_FIXED, sizeof(StderrArg));
+    if (arg)
+    {
+        arg->hErr = hErrRead.Detach();
+        arg->out  = &proc->errBytes;
+        proc->hStderrThread = CreateThread(NULL, 0, DrainStderr, arg, 0, NULL);
+        if (!proc->hStderrThread)
+        {
+            CloseHandle(arg->hErr);
+            LocalFree(arg);
+        }
+    }
+    if (!proc->hStderrThread)
+    {
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hProcess);
+        if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
+        if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
+        return false;
     }
 
     // Cookie file first: curl reads it at startup, before the request body.
@@ -361,77 +414,45 @@ DWORD RunCurl(const CurlRequest& req)
     if (bHasBody && hPipe != INVALID_HANDLE_VALUE)
         ServePipe(hPipe, pi.hProcess, req.pPostData, req.cbPostData);
 
-    // -----------------------------------------------------------------------
-    //  Drain stdout before waiting: curl may block on a full pipe buffer,
-    //  which would prevent it from ever exiting.  We read until EOF (write
-    //  end closed above), then wait — curl should already be done by then.
-    //
-    //  Small responses (<= kSpillThreshold) accumulate in pStdoutOut.
-    //  Once the threshold is crossed we open pszSpillFile and write
-    //  everything there instead — no memory cap, no curl error 23.
-    // -----------------------------------------------------------------------
-    if (req.pStdoutOut && hOutRead.Valid())
+    proc->hProcess = pi.hProcess;
+    proc->hOut     = hOutRead.Detach();
+    return true;
+}
+
+DWORD FinishCurl(CurlProcess* proc, Bytes* pStderrOut)
+{
+    DWORD dwExit = FETCH_LAUNCH_FAILED;
+    if (proc->hOut != INVALID_HANDLE_VALUE)
     {
-        req.pStdoutOut->Free();
-        if (req.pDidSpill) *req.pDidSpill = false;
-
-        HANDLE hSpill = INVALID_HANDLE_VALUE;
-        BYTE   buf[65536];
-        DWORD  cbRead = 0;
-        while (ReadFile(hOutRead.Get(), buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
-        {
-            // Switch to spill file once threshold is exceeded.
-            if (hSpill == INVALID_HANDLE_VALUE &&
-                req.pszSpillFile &&
-                req.pStdoutOut->size + cbRead > kSpillThreshold)
-            {
-                hSpill = CreateFileW(req.pszSpillFile, GENERIC_WRITE, 0, NULL,
-                                     CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (hSpill != INVALID_HANDLE_VALUE)
-                {
-                    // Flush already-buffered bytes to file first.
-                    DWORD cbWritten = 0;
-                    WriteFile(hSpill, req.pStdoutOut->data, req.pStdoutOut->size,
-                              &cbWritten, NULL);
-                    req.pStdoutOut->Free();
-                    if (req.pDidSpill) *req.pDidSpill = true;
-                }
-            }
-
-            if (hSpill != INVALID_HANDLE_VALUE)
-            {
-                DWORD cbWritten = 0;
-                WriteFile(hSpill, buf, cbRead, &cbWritten, NULL);
-            }
-            else
-            {
-                req.pStdoutOut->Append(buf, cbRead);
-            }
-        }
-
-        if (hSpill != INVALID_HANDLE_VALUE)
-            CloseHandle(hSpill);
-        hOutRead.Close();
+        CloseHandle(proc->hOut);
+        proc->hOut = INVALID_HANDLE_VALUE;
     }
-
-    DWORD dwExit = 1;
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &dwExit);
-
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    // Drain the stderr pipe into the caller's buffer.
-    // Curl has exited by now so the amount is small and bounded.
-    if (req.pStderrOut && hErrRead.Valid())
+    // The drain thread reads until stderr EOF, which arrives as curl exits.
+    if (proc->hStderrThread)
     {
-        req.pStderrOut->Free();
-        BYTE buf[4096];
-        DWORD cbRead = 0;
-        while (ReadFile(hErrRead.Get(), buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
-            req.pStderrOut->Append(buf, cbRead);
+        WaitForSingleObject(proc->hStderrThread, INFINITE);
+        CloseHandle(proc->hStderrThread);
+        proc->hStderrThread = NULL;
     }
-
+    if (proc->hProcess)
+    {
+        WaitForSingleObject(proc->hProcess, INFINITE);
+        GetExitCodeProcess(proc->hProcess, &dwExit);
+        CloseHandle(proc->hProcess);
+        proc->hProcess = NULL;
+    }
+    if (pStderrOut)
+    {
+        pStderrOut->Free();
+        if (proc->errBytes.size)
+            pStderrOut->Append(proc->errBytes.data, proc->errBytes.size);
+    }
+    proc->errBytes.Free();
+    if (proc->hErr != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(proc->hErr);
+        proc->hErr = INVALID_HANDLE_VALUE;
+    }
     return dwExit;
 }
 

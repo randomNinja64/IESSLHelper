@@ -13,7 +13,8 @@
 //  process - top-level navigation, <img>, <link>, <script>, XHR, etc. - is
 //  routed through this object instead of WinInet.  We shell out to a
 //  bundled curl.exe (which uses its own modern OpenSSL) and stream the
-//  response back to URLMon.
+//  response back to URLMon.  Downloads are left to IE: we report the
+//  server's headers and IE shows its own download dialog.
 //
 //  Threading:
 //    Start (apartment thread)
@@ -21,24 +22,33 @@
 //                |
 //                v
 //        Worker thread
-//                +--- run curl.exe -> body+stderr in temp files
-//                +--- read body / build error page into m_body
+//                +--- curl -i: parse the response headers from stdout
+//                +--- append body chunks to m_buf (at most kMaxQueued)
 //                +--- pSink->Switch(&pd)   ; ask URLMon to call us back
 //                                           ; on the apartment thread
 //                v
-//        Continue (apartment thread)
-//                +--- ReportProgress(MIMETYPE)
-//                +--- ReportData(DATAFULLYAVAILABLE, m_body.size)
-//                +--- ReportResult(S_OK)
+//        Continue (apartment thread, once per Switch)
+//                +--- first: ReportProgress(disposition, MIME type)
+//                +--- ReportData(progress)
+//                +--- at the end: ReportResult
 //        Read (apartment thread, repeatedly)
-//                +--- memcpy from m_body
+//                +--- drain m_buf; E_PENDING until the worker is done
 // ===========================================================================
 
 using curlbho::Bytes;
+using curlbho::CurlProcess;
 using curlbho::CurlRequest;
 using curlbho::ScopedHandle;
 
 namespace {
+
+// Body bytes the worker may queue ahead of Read before it stops reading
+// curl's stdout (curl then blocks on the full pipe).
+static const DWORD kMaxQueued = 4 * 1024 * 1024;
+// Read compacts m_buf once this much has been consumed.
+static const DWORD kCompactAt = 1024 * 1024;
+// Responses whose headers exceed this are treated as failures.
+static const DWORD kMaxHeaderBytes = 1024 * 1024;
 
 // Helper used when parsing response headers — replaces a C++11 lambda so the
 // file compiles with VC9 (VS2008).
@@ -129,29 +139,196 @@ static void StoreSetCookie(LPCWSTR pszURL, const char* v, DWORD vlen)
     LocalFree(psz);
 }
 
+// Finds the final (non-1xx) header block in what curl -i has written so far.
+// Returns false until that block's terminating blank line has arrived.
+static bool FindHeaderBlock(const Bytes& b, DWORD* pStart, DWORD* pBody)
+{
+    const char* s = (const char*)b.data;
+    DWORD start = 0;
+    for (DWORD i = 0; i + 1 < b.size; ++i)
+    {
+        DWORD end = 0;
+        if (s[i] == '\n' && s[i + 1] == '\n')
+            end = i + 2;
+        else if (s[i] == '\n' && s[i + 1] == '\r' && i + 2 < b.size && s[i + 2] == '\n')
+            end = i + 3;
+        if (!end)
+            continue;
+        // "HTTP/1.1 1xx" is followed by another block.
+        const char* sp = (const char*)memchr(s + start, ' ', i - start);
+        if (sp && sp + 1 < s + i && sp[1] == '1')
+        {
+            start = end;
+            i = end - 1;
+            continue;
+        }
+        *pStart = start;
+        *pBody  = end;
+        return true;
+    }
+    return false;
+}
+
+// True when v contains tok as a comma/space separated word.
+static bool ContainsToken(const char* v, DWORD n, const char* tok)
+{
+    const DWORD tlen = lstrlenA(tok);
+    for (DWORD i = 0; i + tlen <= n; ++i)
+    {
+        const bool edge = (i == 0) || v[i - 1] == ' ' || v[i - 1] == ',' || v[i - 1] == '\t';
+        const char after = (i + tlen < n) ? v[i + tlen] : ',';
+        if (edge && _strnicmp(v + i, tok, tlen) == 0 &&
+            (after == ' ' || after == ',' || after == '\t'))
+            return true;
+    }
+    return false;
+}
+
+static int HexVal(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    c |= 0x20;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+// Parses a Content-Disposition value: the disposition type, and filename*
+// (RFC 5987, preferred) or filename.
+static void ParseDisposition(const char* v, DWORD vlen,
+                             bool* pAttach, CComBSTR& filename)
+{
+    const char* p   = v;
+    const char* end = v + vlen;
+    while (p < end && (*p == ' ' || *p == '\t')) ++p;
+    const char* t = p;
+    while (p < end && *p != ';' && *p != ' ' && *p != '\t') ++p;
+    *pAttach = (p - t == 10 && _strnicmp(t, "attachment", 10) == 0);
+
+    char plain[1024]; int cchPlain = 0;
+    char ext[1024];   int cchExt   = 0;
+    UINT cpExt = CP_UTF8;
+    for (;;)
+    {
+        while (p < end && *p != ';') ++p;
+        if (p >= end) break;
+        ++p;
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+        const char* n = p;
+        while (p < end && *p != '=' && *p != ';') ++p;
+        const char* nEnd = p;
+        while (nEnd > n && (nEnd[-1] == ' ' || nEnd[-1] == '\t')) --nEnd;
+        if (p >= end || *p != '=') continue;
+        ++p;
+        while (p < end && (*p == ' ' || *p == '\t')) ++p;
+
+        char val[1024];
+        int  cv = 0;
+        if (p < end && *p == '"')
+        {
+            for (++p; p < end && *p != '"'; ++p)
+            {
+                if (*p == '\\' && p + 1 < end) ++p;
+                if (cv < (int)sizeof(val)) val[cv++] = *p;
+            }
+            if (p < end) ++p;
+        }
+        else
+        {
+            for (; p < end && *p != ';'; ++p)
+                if (cv < (int)sizeof(val)) val[cv++] = *p;
+            while (cv > 0 && (val[cv - 1] == ' ' || val[cv - 1] == '\t')) --cv;
+        }
+
+        const int nlen = (int)(nEnd - n);
+        if (nlen == 9 && _strnicmp(n, "filename*", 9) == 0)
+        {
+            // charset'language'percent-encoded
+            int q1 = 0;
+            while (q1 < cv && val[q1] != '\'') ++q1;
+            int q2 = q1 + 1;
+            while (q2 < cv && val[q2] != '\'') ++q2;
+            if (q2 >= cv) continue;
+            cpExt = (q1 == 5 && _strnicmp(val, "utf-8", 5) == 0) ? CP_UTF8
+                  : (q1 == 10 && _strnicmp(val, "iso-8859-1", 10) == 0) ? 28591
+                  : CP_ACP;
+            cchExt = 0;
+            for (int i = q2 + 1; i < cv; ++i)
+            {
+                int hi, lo;
+                if (val[i] == '%' && i + 2 < cv &&
+                    (hi = HexVal(val[i + 1])) >= 0 && (lo = HexVal(val[i + 2])) >= 0)
+                {
+                    ext[cchExt++] = (char)(hi * 16 + lo);
+                    i += 2;
+                }
+                else
+                    ext[cchExt++] = val[i];
+            }
+        }
+        else if (nlen == 8 && _strnicmp(n, "filename", 8) == 0)
+        {
+            memcpy(plain, val, cv);
+            cchPlain = cv;
+        }
+    }
+
+    WCHAR wbuf[1024];
+    int wlen = 0;
+    if (cchExt > 0)
+        wlen = MultiByteToWideChar(cpExt, 0, ext, cchExt, wbuf, _countof(wbuf) - 1);
+    if (wlen <= 0 && cchPlain > 0)
+    {
+        // Servers send raw UTF-8 or the local code page here.
+        wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, plain, cchPlain,
+                                   wbuf, _countof(wbuf) - 1);
+        if (wlen <= 0)
+            wlen = MultiByteToWideChar(CP_ACP, 0, plain, cchPlain, wbuf, _countof(wbuf) - 1);
+    }
+    if (wlen > 0)
+    {
+        wbuf[wlen] = 0;
+        filename = wbuf;
+    }
+}
+
+static void SwitchTo(IInternetProtocolSink* sink)
+{
+    PROTOCOLDATA pd;
+    ZeroMemory(&pd, sizeof(pd));
+    pd.dwState  = 1;
+    pd.grfFlags = PI_FORCE_ASYNC;
+    sink->Switch(&pd);
+}
+
 // ---------------------------------------------------------------------------
 //  CurlProtocol - the IInternetProtocol implementation.
 // ---------------------------------------------------------------------------
 class ATL_NO_VTABLE CurlProtocol :
     public CComObjectRootEx<CComMultiThreadModel>,
     public IInternetProtocol,
-    public IInternetProtocolInfo
+    public IInternetProtocolInfo,
+    public IWinInetHttpInfo
 {
 public:
     BEGIN_COM_MAP(CurlProtocol)
         COM_INTERFACE_ENTRY(IInternetProtocol)
         COM_INTERFACE_ENTRY(IInternetProtocolRoot)
         COM_INTERFACE_ENTRY(IInternetProtocolInfo)
+        COM_INTERFACE_ENTRY(IWinInetHttpInfo)
+        COM_INTERFACE_ENTRY(IWinInetInfo)
     END_COM_MAP()
 
-    CurlProtocol() : m_pos(0), m_isError(false), m_bodyFileSize(0),
+    CurlProtocol() : m_bufPos(0), m_received(0), m_isError(false),
                      m_isAttachment(false), m_status(200),
-                     m_bAbort(false), m_bReady(false)
+                     m_contentLength((ULONGLONG)-1), m_hasEncoding(false),
+                     m_hrResult(S_OK), m_hProcess(NULL), m_needFile(false),
+                     m_bAbort(false), m_bHeaders(false), m_bDone(false),
+                     m_bNotifyPending(false), m_bResultReported(false),
+                     m_bReported(false), m_bCacheReported(false)
     {
-        m_szBodyFile[0]   = 0;
-        m_szHeaderFile[0] = 0;
+        m_szCache[0] = 0;
+        m_hRoom.Attach(CreateEventW(NULL, FALSE, FALSE, NULL));
     }
-    ~CurlProtocol() { CloseAndDeleteBodyFile(); DeleteHeaderFile(); }
 
     // IInternetProtocolRoot ------------------------------------------------
     STDMETHOD(Start)(LPCWSTR szURL, IInternetProtocolSink* pSink,
@@ -177,27 +354,25 @@ public:
     STDMETHOD(QueryInfo)(LPCWSTR, QUERYOPTION, DWORD, LPVOID, DWORD,
                          DWORD*, DWORD)                      { return INET_E_DEFAULT_ACTION; }
 
+    // IWinInetHttpInfo - IE's download code reads the response headers here.
+    STDMETHOD(QueryOption)(DWORD, LPVOID, DWORD*)            { return E_NOTIMPL; }
+    STDMETHOD(QueryInfo)(DWORD dwOption, LPVOID pBuffer, DWORD* pcbBuf,
+                         DWORD* pdwFlags, DWORD* pdwReserved);
+
 private:
     static DWORD WINAPI WorkerProc(LPVOID p);
-
-    void CloseAndDeleteBodyFile()
-    {
-        m_hBodyFile.Close();
-        if (m_szBodyFile[0])
-        {
-            DeleteFileW(m_szBodyFile);
-            m_szBodyFile[0] = 0;
-        }
-    }
-
-    void DeleteHeaderFile()
-    {
-        if (m_szHeaderFile[0])
-        {
-            DeleteFileW(m_szHeaderFile);
-            m_szHeaderFile[0] = 0;
-        }
-    }
+    void ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
+                      WCHAR* szLocation, DWORD cchLocation);
+    void ClearHopHeaders();
+    void BeginCache();
+    void WriteCache(const BYTE* p, DWORD n);
+    void SealCache();
+    void DiscardCache();
+    bool Deliver(const BYTE* p, DWORD n);
+    void Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrBytes);
+    void ReportHeaders(IInternetProtocolSink* sink, const BYTE* sniff, DWORD cbSniff);
+    bool FindHeader(const char* name, const char** pv, DWORD* pn) const;
+    void KillCurl() { if (m_hProcess) TerminateProcess(m_hProcess, 1); }
 
     CComPtr<IInternetProtocolSink> m_sink;
     CComBSTR                       m_url;
@@ -205,300 +380,479 @@ private:
     CComBSTR                       m_contentType;   // Content-Type for POST/PUT
     CComBSTR                       m_extraHeaders;  // extra request headers
     Bytes                          m_postData;      // request body for POST/PUT
-    Bytes                          m_body;          // small response body or error page
-    DWORD                          m_pos;           // read cursor into m_body
-    bool                           m_isError;       // true if m_body holds an error page
 
-    // Large response (spill) path: body is streamed from a temp file.
-    WCHAR                          m_szBodyFile[MAX_PATH + 8];
-    ScopedHandle                   m_hBodyFile;
-    ULONGLONG                      m_bodyFileSize;
+    // Response body queued for Read: unread bytes are m_buf[m_bufPos..size).
+    Bytes                          m_buf;
+    DWORD                          m_bufPos;
+    ULONGLONG                      m_received;      // body bytes queued so far
+    bool                           m_isError;       // true if m_buf holds an error page
 
-    // Response headers captured from curl (-D).
-    WCHAR                          m_szHeaderFile[MAX_PATH + 8];
+    // Response headers. Written by the worker before m_bHeaders is set.
+    Bytes                          m_rawHeaders;            // final header block, CRLF lines
     CComBSTR                       m_serverContentType;     // from Content-Type:
-    CComBSTR                       m_contentDisposition;    // from Content-Disposition:
-    CComBSTR                       m_dispositionFilename;   // filename= / filename*= value
-    bool                           m_isAttachment;          // CD says "attachment"
+    CComBSTR                       m_dispositionFilename;   // filename*= / filename= value
+    bool                           m_isAttachment;          // disposition type is "attachment"
     DWORD                          m_status;                // final HTTP status code
+    ULONGLONG                      m_contentLength;         // -1 when not sent
+    bool                           m_hasEncoding;           // Content-Length is pre-decompression
 
-    // Guarded by Lock(). Until m_bReady, the worker owns the response
-    // fields; Abort/Terminate only set m_bAbort and leave cleanup to it.
+    // Guarded by Lock().
+    HRESULT                        m_hrResult;
+    HANDLE                         m_hProcess;      // curl while it runs, else NULL
+    bool                           m_needFile;      // bind asked for BINDF_NEEDFILE
+    // Download dialog reads this file (it will not cache HTTPS itself).
+    // Kept after a successful bind; deleted if the bind is aborted.
+    WCHAR                          m_szCache[MAX_PATH];
+    ScopedHandle                   m_hCache;
     bool                           m_bAbort;
-    bool                           m_bReady;
+    bool                           m_bHeaders;
+    bool                           m_bDone;         // m_buf holds the rest of the response
+    bool                           m_bNotifyPending;// a Switch is queued for Continue
+    bool                           m_bResultReported;
+    ScopedHandle                   m_hRoom;         // set when Read frees queue space
+
+    bool                           m_bReported;     // apartment thread only
+    bool                           m_bCacheReported;
 };
+
+void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
+                                WCHAR* szLocation, DWORD cchLocation)
+{
+    const char* p    = block;
+    const char* pEnd = block + cb;
+    while (p < pEnd)
+    {
+        const char* lineEnd = p;
+        while (lineEnd < pEnd && *lineEnd != '\r' && *lineEnd != '\n')
+            ++lineEnd;
+        DWORD lineLen = (DWORD)(lineEnd - p);
+        if (lineLen)
+        {
+            // IE6 refuses to save an HTTPS download when these say
+            // no-cache or no-store (KB 323308).  "private" is cacheable.
+            const char* store = p;
+            DWORD storeLen = lineLen;
+            char repl[40];
+            if (const char* v = MatchHdr(p, lineLen, lineEnd, "Cache-Control", 13))
+            {
+                DWORD vn = (DWORD)(lineEnd - v);
+                if (ContainsToken(v, vn, "no-cache") || ContainsToken(v, vn, "no-store"))
+                {
+                    lstrcpyA(repl, "Cache-Control: private");
+                    store = repl;
+                    storeLen = lstrlenA(repl);
+                }
+            }
+            else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Pragma", 6))
+            {
+                if (ContainsToken(v, (DWORD)(lineEnd - v), "no-cache"))
+                    storeLen = 0;
+            }
+            if (storeLen)
+            {
+                m_rawHeaders.Append(store, storeLen);
+                m_rawHeaders.AppendStr("\r\n");
+            }
+        }
+
+        if (p == block && lineLen > 5 && _strnicmp(p, "HTTP/", 5) == 0)
+        {
+            const char* s = p + 5;
+            while (s < lineEnd && *s != ' ') ++s;
+            while (s < lineEnd && *s == ' ') ++s;
+            DWORD code = 0;
+            while (s < lineEnd && *s >= '0' && *s <= '9')
+                code = code * 10 + (DWORD)(*s++ - '0');
+            if (code) m_status = code;
+        }
+        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10))
+        {
+            StoreSetCookie(pszPage, v, (DWORD)(lineEnd - v));
+        }
+        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Location", 8))
+        {
+            int wlen = MultiByteToWideChar(CP_UTF8, 0, v, (int)(lineEnd - v),
+                                          szLocation, cchLocation - 1);
+            szLocation[wlen > 0 ? wlen : 0] = 0;
+        }
+        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
+        {
+            DWORD vlen = (DWORD)(lineEnd - v);
+            // Strip any "; charset=..." parameters for the MIME.
+            DWORD mlen = 0;
+            while (mlen < vlen && v[mlen] != ';' &&
+                   v[mlen] != ' ' && v[mlen] != '\t') ++mlen;
+            if (mlen > 0)
+            {
+                WCHAR wbuf[256];
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, v, mlen,
+                                              wbuf, _countof(wbuf) - 1);
+                if (wlen > 0) { wbuf[wlen] = 0; m_serverContentType = wbuf; }
+            }
+        }
+        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Length", 14))
+        {
+            ULONGLONG len = 0;
+            const char* s = v;
+            while (s < lineEnd && *s >= '0' && *s <= '9')
+                len = len * 10 + (ULONGLONG)(*s++ - '0');
+            if (s > v) m_contentLength = len;
+        }
+        else if (MatchHdr(p, lineLen, lineEnd, "Content-Encoding", 16))
+        {
+            m_hasEncoding = true;
+        }
+        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Disposition", 19))
+        {
+            ParseDisposition(v, (DWORD)(lineEnd - v),
+                             &m_isAttachment, m_dispositionFilename);
+        }
+        p = lineEnd;
+        if (p < pEnd && *p == '\r') ++p;
+        if (p < pEnd && *p == '\n') ++p;
+    }
+    m_rawHeaders.AppendStr("\r\n");
+
+    Lock();
+    m_bHeaders = true;
+    Unlock();
+}
+
+void CurlProtocol::ClearHopHeaders()
+{
+    m_rawHeaders.Free();
+    m_serverContentType.Empty();
+    m_dispositionFilename.Empty();
+    m_isAttachment  = false;
+    m_status        = 200;
+    m_contentLength = (ULONGLONG)-1;
+    m_hasEncoding   = false;
+    Lock();
+    m_bHeaders = false;
+    Unlock();
+}
+
+// Last path segment of a URL or header filename, with characters Windows
+// rejects in a file name (and '#', '%', which break the name as a URL)
+// turned into underscores.
+static void SafeFileName(LPCWSTR src, WCHAR* dst, int cchDst)
+{
+    const WCHAR* base = src ? src : L"";
+    const WCHAR* end = base;
+    for (const WCHAR* q = base; *q && *q != L'?' && *q != L'#'; ++q)
+    {
+        end = q + 1;
+        if (*q == L'/' || *q == L'\\') base = end;
+    }
+    int n = 0;
+    for (const WCHAR* q = base; q < end && n < cchDst - 1; ++q)
+    {
+        WCHAR c = *q;
+        if (c < 32 || wcschr(L"<>:\"|?*#%", c))
+            c = L'_';
+        dst[n++] = c;
+    }
+    while (n > 0 && (dst[n - 1] == L'.' || dst[n - 1] == L' '))
+        --n;
+    dst[n] = 0;
+    if (!dst[0])
+        lstrcpynW(dst, L"download", cchDst);
+}
+
+// IE's download dialog binds with BINDF_NEEDFILE | BINDF_NOWRITECACHE, so it
+// never writes the cache itself.  It also labels the file with this path's
+// name.  WinInet names a cache file after the URL's last segment, so the
+// entry is created for a URL ending in the server's filename.
+void CurlProtocol::BeginCache()
+{
+    if (m_szCache[0])
+        return;
+
+    WCHAR szName[MAX_PATH];
+    SafeFileName(m_dispositionFilename.Length() > 0
+                     ? (LPCWSTR)m_dispositionFilename : (LPCWSTR)m_url,
+                 szName, _countof(szName));
+    const WCHAR* ext = wcsrchr(szName, L'.');
+    ext = ext ? ext + 1 : NULL;
+
+    WCHAR szNameUrl[INTERNET_MAX_URL_LENGTH];
+    DWORD cchNameUrl = _countof(szNameUrl);
+    if (FAILED(UrlCombineW(m_url, szName, szNameUrl, &cchNameUrl, 0)))
+        return;
+
+    WCHAR szPath[MAX_PATH];
+    const DWORD cbExpected = (m_contentLength != (ULONGLONG)-1 && m_contentLength <= MAXDWORD)
+                             ? (DWORD)m_contentLength : 0;
+    if (!CreateUrlCacheEntryW(szNameUrl, cbExpected, ext, szPath, 0))
+        return;
+
+    HANDLE h = CreateFileW(szPath, GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        DeleteFileW(szPath);
+        return;
+    }
+    Lock();
+    if (m_bAbort)
+    {
+        Unlock();
+        CloseHandle(h);
+        DeleteFileW(szPath);
+        return;
+    }
+    m_hCache.Attach(h);
+    lstrcpynW(m_szCache, szPath, _countof(m_szCache));
+    Unlock();
+}
+
+void CurlProtocol::WriteCache(const BYTE* p, DWORD n)
+{
+    if (!n)
+        return;
+    Lock();
+    if (m_hCache.Valid() && !m_bAbort)
+    {
+        DWORD cb = 0;
+        WriteFile(m_hCache.Get(), p, n, &cb, NULL);
+    }
+    Unlock();
+}
+
+void CurlProtocol::SealCache()
+{
+    Lock();
+    if (m_hCache.Valid())
+    {
+        FlushFileBuffers(m_hCache.Get());
+        m_hCache.Close();
+    }
+    Unlock();
+}
+
+void CurlProtocol::DiscardCache()
+{
+    m_hCache.Close();
+    if (m_szCache[0])
+    {
+        DeleteFileW(m_szCache);
+        m_szCache[0] = 0;
+    }
+}
+
+// Queues one body chunk for Read, waiting while kMaxQueued bytes are unread.
+// False if the bind was aborted or memory ran out.
+bool CurlProtocol::Deliver(const BYTE* p, DWORD n)
+{
+    WriteCache(p, n);
+    Lock();
+    while (!m_bAbort && m_buf.size - m_bufPos >= kMaxQueued)
+    {
+        Unlock();
+        WaitForSingleObject(m_hRoom.Get(), INFINITE);
+        Lock();
+    }
+    if (m_bAbort || !m_buf.Append(p, n))
+    {
+        if (!m_bAbort) m_hrResult = E_OUTOFMEMORY;
+        Unlock();
+        return false;
+    }
+    m_received += n;
+    CComPtr<IInternetProtocolSink> sink;
+    if (!m_bNotifyPending) { m_bNotifyPending = true; sink = m_sink; }
+    Unlock();
+    if (sink) SwitchTo(sink);
+    return true;
+}
+
+void CurlProtocol::Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrBytes)
+{
+    SealCache();
+    Lock();
+    if (m_bAbort)
+    {
+        m_buf.Free();
+        m_bufPos = 0;
+        Unlock();
+        return;
+    }
+    if (!haveHeaders)
+    {
+        m_buf.Free();
+        m_bufPos = 0;
+        curlbho::BuildErrorPage(m_buf, m_url, dwExit, stderrBytes);
+        m_isError  = true;
+        m_received = m_buf.size;
+    }
+    else if (dwExit != 0 || m_hrResult != S_OK)
+    {
+        // Connection dropped mid-body: IE marks the download as failed.
+        if (m_hrResult == S_OK)
+            m_hrResult = INET_E_DOWNLOAD_FAILURE;
+        DiscardCache();
+    }
+    else if (m_szCache[0])
+    {
+        // Register the file under the real URL so IE owns and evicts it.
+        int cch = MultiByteToWideChar(CP_ACP, 0, (const char*)m_rawHeaders.data,
+                                      (int)m_rawHeaders.size, NULL, 0);
+        WCHAR* pszHeaders = cch > 0
+            ? (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR)) : NULL;
+        if (pszHeaders)
+        {
+            MultiByteToWideChar(CP_ACP, 0, (const char*)m_rawHeaders.data,
+                                (int)m_rawHeaders.size, pszHeaders, cch);
+            pszHeaders[cch] = 0;
+        }
+        FILETIME zero = { 0, 0 };
+        CommitUrlCacheEntryW(m_url, m_szCache, zero, zero, NORMAL_CACHE_ENTRY,
+                             pszHeaders, pszHeaders ? (DWORD)cch : 0, NULL, NULL);
+        if (pszHeaders) LocalFree(pszHeaders);
+    }
+    m_bDone = true;
+    CComPtr<IInternetProtocolSink> sink;
+    if (!m_bNotifyPending) { m_bNotifyPending = true; sink = m_sink; }
+    Unlock();
+    if (sink) SwitchTo(sink);
+}
 
 DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
 {
     CurlProtocol* self = static_cast<CurlProtocol*>(p);
 
-    DWORD dwExit = curlbho::FETCH_LAUNCH_FAILED;
+    WCHAR hop[INTERNET_MAX_URL_LENGTH];
+    lstrcpynW(hop, self->m_url, _countof(hop));
+
+    bool haveHeaders = false;
+    bool redirected  = false;
+    bool asGet       = false;
+    DWORD dwExit     = curlbho::FETCH_LAUNCH_FAILED;
     Bytes stderrBytes;
 
-    // Prepare a spill-file path in case the response exceeds kSpillThreshold,
-    // and a header-dump file so we can read the server's real Content-Type
-    // and Content-Disposition (the only reliable signal for "is this a
-    // download?" — never trust MIME sniffing for that decision).
-    WCHAR szOut[MAX_PATH + 8] = L"";
-    WCHAR szHdr[MAX_PATH + 8] = L"";
+    // One pass per redirect hop.  A document navigation reports the redirect
+    // to URLMon.  A download bind (BINDF_NEEDFILE) does not follow that
+    // result, so those hops are fetched here.
+    for (int nHop = 0; nHop < 5 && !redirected && !haveHeaders; ++nHop)
     {
-        WCHAR szDir[MAX_PATH], szBase[MAX_PATH];
-        if (GetTempPathW(MAX_PATH, szDir) &&
-            GetTempFileNameW(szDir, L"curl", 0, szBase))
+        self->Lock();
+        const bool aborted = self->m_bAbort;
+        self->Unlock();
+        if (aborted)
+            break;
+
+        Bytes cookieJar;
+        BuildCookieJar(hop, cookieJar);
+
+        CurlRequest req;
+        ZeroMemory(&req, sizeof(req));
+        req.pszURL          = hop;
+        req.pCookieJar      = cookieJar.size ? cookieJar.data : NULL;
+        req.cbCookieJar     = cookieJar.size;
+        req.pszExtraHeaders = self->m_extraHeaders.Length() > 0
+                              ? (LPCWSTR)self->m_extraHeaders : NULL;
+        if (!asGet)
         {
-            DeleteFileW(szBase);
-            lstrcpynW(szOut, szBase, MAX_PATH); lstrcatW(szOut, L".out");
-            lstrcpynW(szHdr, szBase, MAX_PATH); lstrcatW(szHdr, L".hdr");
+            req.pszVerb        = self->m_verb.Length()        > 0 ? (LPCWSTR)self->m_verb        : NULL;
+            req.pszContentType = self->m_contentType.Length() > 0 ? (LPCWSTR)self->m_contentType : NULL;
+            req.pPostData      = self->m_postData.data;
+            req.cbPostData     = self->m_postData.size;
         }
-    }
-    Bytes cookieJar;
-    BuildCookieJar(self->m_url, cookieJar);
 
-    bool didSpill = false;
-    CurlRequest req;
-    ZeroMemory(&req, sizeof(req));
-    req.pszURL          = self->m_url;
-    req.pStdoutOut      = &self->m_body;
-    req.pszSpillFile    = szOut[0] ? szOut : NULL;
-    req.pDidSpill       = &didSpill;
-    req.pStderrOut      = &stderrBytes;
-    req.pszHeaderFile   = szHdr[0] ? szHdr : NULL;
-    req.pCookieJar      = cookieJar.size ? cookieJar.data : NULL;
-    req.cbCookieJar     = cookieJar.size;
-    req.pszVerb         = self->m_verb.Length()         > 0 ? (LPCWSTR)self->m_verb         : NULL;
-    req.pszContentType  = self->m_contentType.Length()  > 0 ? (LPCWSTR)self->m_contentType  : NULL;
-    req.pszExtraHeaders = self->m_extraHeaders.Length() > 0 ? (LPCWSTR)self->m_extraHeaders : NULL;
-    req.pPostData       = self->m_postData.data;
-    req.cbPostData      = self->m_postData.size;
+        CurlProcess proc;
+        if (!curlbho::StartCurl(req, &proc))
+            break;
 
-    dwExit = curlbho::RunCurl(req);
+        self->Lock();
+        self->m_hProcess = proc.hProcess;
+        if (self->m_bAbort) self->KillCurl();
+        self->Unlock();
 
-    if (dwExit == 0)
-    {
-        if (didSpill)
+        Bytes head;
+        bool  stop   = false;
+        bool  follow = false;
+        BYTE  buf[65536];
+        DWORD cbRead = 0;
+        while (!stop && ReadFile(proc.hOut, buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
         {
-            // Large response: open the spill file for streaming in Read().
-            lstrcpynW(self->m_szBodyFile, szOut, _countof(self->m_szBodyFile));
-            HANDLE h = CreateFileW(szOut, GENERIC_READ,
-                                   FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                   NULL, OPEN_EXISTING,
-                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
-                                   NULL);
-            if (h == INVALID_HANDLE_VALUE)
+            if (haveHeaders)
             {
-                DeleteFileW(szOut);
-                self->m_szBodyFile[0] = 0;
-                dwExit = curlbho::FETCH_LAUNCH_FAILED;
+                stop = !self->Deliver(buf, cbRead);
+                continue;
+            }
+            if (!head.Append(buf, cbRead) || head.size > kMaxHeaderBytes)
+            {
+                stop = true;
+                continue;
+            }
+            DWORD start = 0, body = 0;
+            if (!FindHeaderBlock(head, &start, &body))
+                continue;
+
+            WCHAR szLocation[INTERNET_MAX_URL_LENGTH] = L"";
+            self->ParseHeaders((const char*)head.data + start, body - start,
+                               hop, szLocation, _countof(szLocation));
+
+            // These are the codes IE6 follows.  Set-Cookie was stored above
+            // so the next hop sees it.
+            const DWORD st = self->m_status;
+            WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
+            DWORD cchTarget = _countof(szTarget);
+            if (szLocation[0] &&
+                (st == 301 || st == 302 || st == 303 || st == 307) &&
+                SUCCEEDED(UrlCombineW(hop, szLocation, szTarget, &cchTarget, 0)))
+            {
+                if (self->m_needFile && nHop + 1 < 5)
+                {
+                    if (st != 307) asGet = true;
+                    lstrcpynW(hop, szTarget, _countof(hop));
+                    follow = stop = true;
+                }
+                else
+                {
+                    self->Lock();
+                    const bool claim = !self->m_bAbort && !self->m_bResultReported;
+                    self->m_bResultReported = true;
+                    CComPtr<IInternetProtocolSink> sink = self->m_sink;
+                    self->Unlock();
+                    if (claim && sink)
+                    {
+                        sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
+                        sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
+                    }
+                    redirected = stop = true;
+                }
             }
             else
             {
-                self->m_hBodyFile.Attach(h);
-                LARGE_INTEGER sz;
-                if (GetFileSizeEx(h, &sz) && sz.QuadPart >= 0)
-                    self->m_bodyFileSize = (ULONGLONG)sz.QuadPart;
+                haveHeaders = true;
+                if (self->m_needFile || self->m_isAttachment)
+                    self->BeginCache();
+                if (body < head.size)
+                    stop = !self->Deliver(head.data + body, head.size - body);
             }
+            head.Free();
         }
-        // else: small response is already in self->m_body — no file needed.
-    }
 
-    if (dwExit != 0)
-    {
-        if (didSpill) DeleteFileW(szOut);
-        self->m_body.Free();
-        curlbho::BuildErrorPage(self->m_body, self->m_url, dwExit, stderrBytes);
-        self->m_isError = true;
-    }
+        self->Lock();
+        if (stop) self->KillCurl();
+        self->m_hProcess = NULL;
+        self->Unlock();
 
-    // Parse the response headers (Content-Type / Content-Disposition) so
-    // Continue() can use the server's authoritative values instead of
-    // guessing from URL extensions or sniffed bytes.  Only the *last*
-    // response block in the file matters (a POST may be preceded by an
-    // interim "100 Continue" block).
-    WCHAR szLocation[INTERNET_MAX_URL_LENGTH] = L"";
-    if (!self->m_isError && szHdr[0])
-    {
-        HANDLE hH = CreateFileW(szHdr, GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_DELETE,
-                                NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (hH != INVALID_HANDLE_VALUE)
+        if (follow)
         {
-            BYTE  buf[8192];
-            Bytes hdrs;
-            DWORD cbRead = 0;
-            while (ReadFile(hH, buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
-                hdrs.Append(buf, cbRead);
-            CloseHandle(hH);
-
-            // Find the start of the *final* HTTP/ status line so we ignore
-            // any interim 1xx blocks.
-            const char* pAll = (const char*)hdrs.data;
-            DWORD       cb   = hdrs.size;
-            const char* pStart = pAll;
-            for (DWORD i = 0; i + 5 < cb; ++i)
-            {
-                if ((i == 0 || pAll[i-1] == '\n') &&
-                    (pAll[i] == 'H' || pAll[i] == 'h') &&
-                    _strnicmp(pAll + i, "HTTP/", 5) == 0)
-                    pStart = pAll + i;
-            }
-            DWORD cbBlock = cb - (DWORD)(pStart - pAll);
-
-            // Walk header lines.
-            const char* p = pStart;
-            const char* pEnd = pStart + cbBlock;
-            while (p < pEnd)
-            {
-                const char* lineEnd = p;
-                while (lineEnd < pEnd && *lineEnd != '\r' && *lineEnd != '\n')
-                    ++lineEnd;
-                DWORD lineLen = (DWORD)(lineEnd - p);
-
-                if (p == pStart && lineLen > 5 && _strnicmp(p, "HTTP/", 5) == 0)
-                {
-                    const char* s = p + 5;
-                    while (s < lineEnd && *s != ' ') ++s;
-                    while (s < lineEnd && *s == ' ') ++s;
-                    DWORD code = 0;
-                    while (s < lineEnd && *s >= '0' && *s <= '9')
-                        code = code * 10 + (DWORD)(*s++ - '0');
-                    if (code) self->m_status = code;
-                }
-                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10))
-                {
-                    StoreSetCookie(self->m_url, v, (DWORD)(lineEnd - v));
-                }
-                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Location", 8))
-                {
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, v, (int)(lineEnd - v),
-                                                  szLocation, _countof(szLocation) - 1);
-                    szLocation[wlen > 0 ? wlen : 0] = 0;
-                }
-                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
-                {
-                    DWORD vlen = (DWORD)(lineEnd - v);
-                    // Strip any "; charset=..." parameters for the MIME.
-                    DWORD mlen = 0;
-                    while (mlen < vlen && v[mlen] != ';' &&
-                           v[mlen] != ' ' && v[mlen] != '\t') ++mlen;
-                    if (mlen > 0)
-                    {
-                        WCHAR wbuf[256];
-                        int wlen = MultiByteToWideChar(CP_UTF8, 0, v, mlen,
-                                                      wbuf, _countof(wbuf) - 1);
-                        if (wlen > 0) { wbuf[wlen] = 0; self->m_serverContentType = wbuf; }
-                    }
-                }
-                else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Disposition", 19))
-                {
-                    DWORD vlen = (DWORD)(lineEnd - v);
-                    WCHAR wbuf[1024];
-                    int wlen = MultiByteToWideChar(CP_UTF8, 0, v, vlen,
-                                                  wbuf, _countof(wbuf) - 1);
-                    if (wlen > 0)
-                    {
-                        wbuf[wlen] = 0;
-                        self->m_contentDisposition = wbuf;
-
-                        // "attachment" anywhere in the value (case-insensitive).
-                        for (int i = 0; i + 9 < wlen; ++i)
-                        {
-                            if ((wbuf[i] == L'a' || wbuf[i] == L'A') &&
-                                _wcsnicmp(wbuf + i, L"attachment", 10) == 0)
-                            {
-                                self->m_isAttachment = true;
-                                break;
-                            }
-                        }
-
-                        // Pull out filename= (prefer filename*= when present;
-                        // RFC 5987 encoding is not decoded — best-effort).
-                        const WCHAR* pf = NULL;
-                        for (int i = 0; i + 9 < wlen; ++i)
-                        {
-                            if ((wbuf[i] == L'f' || wbuf[i] == L'F') &&
-                                _wcsnicmp(wbuf + i, L"filename", 8) == 0)
-                            {
-                                int j = i + 8;
-                                if (j < wlen && wbuf[j] == L'*') ++j;
-                                while (j < wlen && (wbuf[j] == L' ' ||
-                                                    wbuf[j] == L'=' ||
-                                                    wbuf[j] == L'\t')) ++j;
-                                pf = wbuf + j;
-                                break;
-                            }
-                        }
-                        if (pf && *pf)
-                        {
-                            WCHAR fn[MAX_PATH];
-                            int   fnlen = 0;
-                            WCHAR quote = 0;
-                            if (*pf == L'"' || *pf == L'\'') { quote = *pf; ++pf; }
-                            while (*pf && fnlen < MAX_PATH - 1)
-                            {
-                                if (quote ? (*pf == quote) : (*pf == L';' || *pf == L' '))
-                                    break;
-                                fn[fnlen++] = *pf++;
-                            }
-                            // Skip any RFC 5987 "UTF-8''" prefix on filename*=.
-                            fn[fnlen] = 0;
-                            const WCHAR* pfn = fn;
-                            const WCHAR* pq  = wcsstr(fn, L"''");
-                            if (pq) pfn = pq + 2;
-                            if (*pfn) self->m_dispositionFilename = pfn;
-                        }
-                    }
-                }
-                p = lineEnd;
-                while (p < pEnd && (*p == '\r' || *p == '\n')) ++p;
-            }
+            curlbho::FinishCurl(&proc, NULL);
+            self->ClearHopHeaders();
+            continue;
         }
-        DeleteFileW(szHdr);
-        szHdr[0] = 0;
-    }
-    if (szHdr[0]) DeleteFileW(szHdr);
 
-    // Hand the response to the apartment thread, unless the bind was
-    // aborted while curl ran. In that case nothing else will free it.
-    CComPtr<IInternetProtocolSink> sink;
-    self->Lock();
-    const bool bAborted = self->m_bAbort;
-    if (bAborted)
-    {
-        self->CloseAndDeleteBodyFile();
-        self->m_body.Free();
+        dwExit = curlbho::FinishCurl(&proc, &stderrBytes);
+        break;
     }
-    else
-    {
-        self->m_bReady = true;
-        sink = self->m_sink;
-    }
-    self->Unlock();
 
-    if (!bAborted && sink)
-    {
-        // Redirects are followed by URLMon, not curl, so each hop's
-        // Set-Cookie reaches WinInet before the next request reads it.
-        // These are the codes IE6 follows.
-        const DWORD st = self->m_status;
-        WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
-        DWORD cchTarget = _countof(szTarget);
-        if (!self->m_isError && szLocation[0] &&
-            (st == 301 || st == 302 || st == 303 || st == 307) &&
-            SUCCEEDED(UrlCombineW(self->m_url, szLocation,
-                                  szTarget, &cchTarget, 0)))
-        {
-            sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
-            sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
-        }
-        else
-        {
-            PROTOCOLDATA pd;
-            ZeroMemory(&pd, sizeof(pd));
-            pd.dwState  = 1;
-            pd.grfFlags = PI_FORCE_ASYNC;
-            sink->Switch(&pd);
-        }
-    }
+    if (!redirected)
+        self->Finish(dwExit, haveHeaders, stderrBytes);
 
     self->Release();      // matches AddRef in Start
     return 0;
@@ -507,12 +861,15 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
 STDMETHODIMP CurlProtocol::Abort(HRESULT hrReason, DWORD)
 {
     Lock();
-    const bool bReady = m_bReady;
     m_bAbort = true;
+    KillCurl();
+    SetEvent(m_hRoom.Get());
+    DiscardCache();
+    const bool claim = !m_bResultReported;
+    m_bResultReported = true;
     CComPtr<IInternetProtocolSink> sink = m_sink;
     Unlock();
-    // The worker will not call Switch now, so finish the bind here.
-    if (!bReady && sink)
+    if (claim && sink)
         sink->ReportResult(hrReason, 0, NULL);
     return S_OK;
 }
@@ -521,12 +878,14 @@ STDMETHODIMP CurlProtocol::Terminate(DWORD)
 {
     Lock();
     m_bAbort = true;
-    if (m_bReady)
-    {
-        CloseAndDeleteBodyFile();
-        m_body.Free();
-    }
-    DeleteHeaderFile();
+    KillCurl();
+    SetEvent(m_hRoom.Get());
+    if (!m_bDone)
+        DiscardCache();
+    else
+        m_hCache.Close();
+    m_buf.Free();
+    m_bufPos = 0;
     m_sink.Release();
     Unlock();
     return S_OK;
@@ -540,23 +899,32 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
 
     m_sink    = pSink;
     m_url     = szURL;
-    m_pos     = 0;
-    m_isError = false;
-    m_body.Free();
+    m_buf.Free();
+    m_bufPos   = 0;
+    m_received = 0;
+    m_isError  = false;
     m_postData.Free();
     m_verb.Empty();
     m_contentType.Empty();
     m_extraHeaders.Empty();
+    m_rawHeaders.Free();
     m_serverContentType.Empty();
-    m_contentDisposition.Empty();
     m_dispositionFilename.Empty();
-    m_isAttachment = false;
-    m_status       = 200;
-    m_bAbort       = false;
-    m_bReady       = false;
-    CloseAndDeleteBodyFile();
-    DeleteHeaderFile();
-    m_bodyFileSize = 0;
+    m_isAttachment    = false;
+    m_status          = 200;
+    m_contentLength   = (ULONGLONG)-1;
+    m_hasEncoding     = false;
+    m_hrResult        = S_OK;
+    m_bAbort          = false;
+    m_bHeaders        = false;
+    m_bDone           = false;
+    m_bNotifyPending  = false;
+    m_bResultReported = false;
+    m_bReported       = false;
+    m_bCacheReported  = false;
+    m_needFile        = false;
+    m_szCache[0]      = 0;
+    ResetEvent(m_hRoom.Get());
 
     // Extract verb, Content-Type, extra headers, and POST body from URLMon.
     if (pBindInfo)
@@ -567,6 +935,8 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
         DWORD grfBINDF = 0;
         if (SUCCEEDED(pBindInfo->GetBindInfo(&grfBINDF, &bi)))
         {
+            if (grfBINDF & BINDF_NEEDFILE)
+                m_needFile = true;
             switch (bi.dwBindVerb)
             {
                 case BINDVERB_POST:
@@ -633,8 +1003,6 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
                 CoTaskMemFree(pszHdrs);
             }
         }
-
-        // Top-level navigation vs. sub-resource detection.
     }
 
     AddRef();   // hold a ref for the worker
@@ -650,279 +1018,134 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     return E_PENDING;
 }
 
-STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
+// First Continue: tell URLMon what the response is.  An attachment
+// disposition makes IE show its download dialog instead of rendering.
+void CurlProtocol::ReportHeaders(IInternetProtocolSink* sink,
+                                 const BYTE* sniffBuf, DWORD cbSniff)
 {
-    if (!m_sink || m_bAbort)
-        return S_OK;
+    if (!m_isError && m_isAttachment)
+        sink->ReportProgress(BINDSTATUS_CONTENTDISPOSITIONATTACH,
+                             m_dispositionFilename.Length() > 0
+                                 ? (LPCWSTR)m_dispositionFilename : L"");
+    if (!m_isError && m_dispositionFilename.Length() > 0)
+        sink->ReportProgress(BINDSTATUS_CONTENTDISPOSITIONFILENAME,
+                             m_dispositionFilename);
 
-    // 1. Tell URLMon about the MIME type.  Error pages are always HTML;
-    //    success bodies prefer the server's Content-Type, then a quick HTML
-    //    sniff, then fall through to FindMimeFromData.
+    // Error pages are always HTML; success bodies prefer the server's
+    // Content-Type, then a quick HTML sniff, then FindMimeFromData.
     LPCWSTR pszMime = L"text/html";
     LPWSTR  pszSniffed = NULL;
-    BYTE    sniffBuf[512];
-    DWORD   cbSniff = 0;
-
-    if (!m_isError)
+    if (!m_isError && m_serverContentType.Length() > 0)
     {
-        // Always prefer the server's Content-Type when present — it's the
-        // only authoritative source.  Sniffing is for the fallback case
-        // where the server didn't send one.
-        if (m_serverContentType.Length() > 0)
-            pszMime = m_serverContentType;
-
-        if (m_hBodyFile.Valid() && m_bodyFileSize > 0)
+        pszMime = m_serverContentType;
+    }
+    else if (!m_isError)
+    {
+        // Quick HTML sniff first.  URLMon's FindMimeFromData is unreliable
+        // on extension-less URLs (e.g. https://google.com/) and will often
+        // return text/plain even for clearly-HTML bodies, which makes IE
+        // render the raw markup.  Look for a doctype or common HTML tag in
+        // the first few hundred bytes; if found, force text/html.
+        bool looksLikeHtml = false;
+        const char* p = (const char*)sniffBuf;
+        for (DWORD i = 0; i < cbSniff; ++i)
         {
-            // Large response (spill): read leading bytes from file, then rewind.
-            DWORD cbWant = (DWORD)((m_bodyFileSize < sizeof(sniffBuf))
-                                   ? m_bodyFileSize : sizeof(sniffBuf));
-            if (!ReadFile(m_hBodyFile.Get(), sniffBuf, cbWant, &cbSniff, NULL))
-                cbSniff = 0;
-            LARGE_INTEGER zero; zero.QuadPart = 0;
-            SetFilePointerEx(m_hBodyFile.Get(), zero, NULL, FILE_BEGIN);
-        }
-        else if (m_body.size > 0)
-        {
-            // Small response: sniff directly from memory.
-            DWORD cbWant = m_body.size < sizeof(sniffBuf) ? m_body.size : sizeof(sniffBuf);
-            memcpy(sniffBuf, m_body.data, cbWant);
-            cbSniff = cbWant;
-        }
-
-        // Only sniff if the server didn't tell us anything.
-        if (m_serverContentType.Length() == 0)
-        {
-            // Quick HTML sniff first.  URLMon's FindMimeFromData is unreliable
-            // on extension-less URLs (e.g. https://google.com/) and will often
-            // return text/plain even for clearly-HTML bodies, which makes IE
-            // render the raw markup.  Look for a doctype or common HTML tag in
-            // the first few hundred bytes; if found, force text/html.
-            bool looksLikeHtml = false;
-            const char* p = (const char*)sniffBuf;
-            for (DWORD i = 0; i < cbSniff; ++i)
+            if (p[i] != '<') continue;
+            DWORD rem = cbSniff - i;
+            #define _MATCHI(s) (rem >= sizeof(s)-1 && _strnicmp(p+i, s, sizeof(s)-1) == 0)
+            if (_MATCHI("<!doctype") || _MATCHI("<html") ||
+                _MATCHI("<head")     || _MATCHI("<body") ||
+                _MATCHI("<script")   || _MATCHI("<title") ||
+                _MATCHI("<meta")     || _MATCHI("<!--"))
             {
-                if (p[i] != '<') continue;
-                DWORD rem = cbSniff - i;
-                #define _MATCHI(s) (rem >= sizeof(s)-1 && _strnicmp(p+i, s, sizeof(s)-1) == 0)
-                if (_MATCHI("<!doctype") || _MATCHI("<html") ||
-                    _MATCHI("<head")     || _MATCHI("<body") ||
-                    _MATCHI("<script")   || _MATCHI("<title") ||
-                    _MATCHI("<meta")     || _MATCHI("<!--"))
-                {
-                    looksLikeHtml = true;
-                    break;
-                }
-                #undef _MATCHI
+                looksLikeHtml = true;
+                break;
             }
+            #undef _MATCHI
+        }
 
-            if (looksLikeHtml)
+        if (!looksLikeHtml && cbSniff > 0)
+        {
+            // Fall through to URLMon for non-HTML resources (CSS/JS/images
+            // and arbitrary downloads).
+            DWORD cbHint = cbSniff < 256 ? cbSniff : 256;
+            if (SUCCEEDED(FindMimeFromData(NULL, m_url,
+                                           (LPVOID)sniffBuf, cbHint,
+                                           NULL, 0, &pszSniffed, 0)) && pszSniffed)
             {
-                pszMime = L"text/html";
-            }
-            else if (cbSniff > 0)
-            {
-                // Fall through to URLMon for non-HTML resources (CSS/JS/images
-                // and arbitrary downloads).
-                DWORD cbHint = cbSniff < 256 ? cbSniff : 256;
-                if (SUCCEEDED(FindMimeFromData(NULL, m_url,
-                                               sniffBuf, cbHint,
-                                               NULL, 0, &pszSniffed, 0)) && pszSniffed)
-                {
-                    pszMime = pszSniffed;
-                }
+                pszMime = pszSniffed;
             }
         }
     }
 
-    // -----------------------------------------------------------------------
-    //  Download handling.
-    //
-    //  We save to the download folder only when BOTH conditions hold:
-    //    1. This is a top-level navigation (the user clicked / typed it),
-    //       not a sub-resource fetch from inside another page.
-    //    2. The server explicitly marked the response as a download via
-    //       Content-Disposition: attachment.
-    //
-    //  Anything else — fonts, scripts, images, XHR, even an inline-served
-    //  octet-stream — just streams its bytes through unchanged.
-    // -----------------------------------------------------------------------
-    bool isDownload = (!m_isError && m_isAttachment &&
-                       (m_body.size > 0 || m_hBodyFile.Valid()));
-
-    if (isDownload)
-    {
-        if (pszSniffed) { CoTaskMemFree(pszSniffed); pszSniffed = NULL; }
-
-        // ------------------------------------------------------------------
-        //  1. Derive a friendly filename.  Prefer the server's
-        //     Content-Disposition filename; otherwise fall back to the URL.
-        // ------------------------------------------------------------------
-        WCHAR szName[MAX_PATH] = L"download";
-        if (m_dispositionFilename.Length() > 0)
-        {
-            lstrcpynW(szName, m_dispositionFilename, MAX_PATH);
-            // Strip any directory components the server tried to inject.
-            WCHAR* pSlash = szName;
-            for (WCHAR* q = szName; *q; ++q)
-                if (*q == L'/' || *q == L'\\') pSlash = q + 1;
-            if (pSlash != szName)
-                lstrcpyW(szName, pSlash);
-            for (WCHAR* q = szName; *q; ++q)
-                if (*q == L'<' || *q == L'>' || *q == L':' || *q == L'"' ||
-                    *q == L'|' || *q == L'?' || *q == L'*' || *q < 32)
-                    *q = L'_';
-        }
-        else
-        {
-            LPCWSTR pu  = (LPCWSTR)m_url;
-            LPCWSTR pq  = wcschr(pu, L'?');
-            LPCWSTR end = pq ? pq : pu + lstrlenW(pu);
-            LPCWSTR p   = end;
-            while (p > pu && *(p - 1) != L'/') --p;
-            int len = (int)(end - p);
-            if (len > 0 && len < MAX_PATH)
-            {
-                lstrcpynW(szName, p, len + 1);
-                for (WCHAR* q = szName; *q; ++q)
-                    if (*q == L'<' || *q == L'>' || *q == L':' || *q == L'"' ||
-                        *q == L'/' || *q == L'\\' || *q == L'|' || *q == L'?' ||
-                        *q == L'*' || *q < 32)
-                        *q = L'_';
-            }
-        }
-        if (!szName[0]) lstrcpyW(szName, L"download");
-
-        // ------------------------------------------------------------------
-        //  2. Determine the download destination folder.
-        //     Prefer IE's configured "Default Download Directory", fall back
-        //     to the Desktop (works on XP through Windows 11).
-        // ------------------------------------------------------------------
-        WCHAR szDownloadDir[MAX_PATH] = L"";
-        {
-            HKEY hk;
-            if (RegOpenKeyExW(HKEY_CURRENT_USER,
-                    L"Software\\Microsoft\\Internet Explorer\\Main",
-                    0, KEY_QUERY_VALUE, &hk) == ERROR_SUCCESS)
-            {
-                DWORD cb   = sizeof(szDownloadDir);
-                DWORD type = 0;
-                RegQueryValueExW(hk, L"Default Download Directory",
-                                 NULL, &type,
-                                 reinterpret_cast<BYTE*>(szDownloadDir), &cb);
-                RegCloseKey(hk);
-            }
-            if (!szDownloadDir[0])
-                SHGetFolderPathW(NULL, CSIDL_DESKTOPDIRECTORY, NULL,
-                                 SHGFP_TYPE_CURRENT, szDownloadDir);
-        }
-
-        // ------------------------------------------------------------------
-        //  3. Write the response to the download folder.
-        //     Spilled (large) responses: move the temp file — fast, no RAM.
-        //     Small (in-memory) responses: write from buffer.
-        // ------------------------------------------------------------------
-        WCHAR szDest[MAX_PATH];
-        lstrcpynW(szDest, szDownloadDir, MAX_PATH);
-        PathAppendW(szDest, szName);
-
-        DeleteFileW(szDest);
-        BOOL bOk = FALSE;
-        if (m_szBodyFile[0])
-        {
-            m_hBodyFile.Close();
-            bOk = MoveFileExW(m_szBodyFile, szDest,
-                              MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED);
-            if (!bOk)
-                bOk = CopyFileW(m_szBodyFile, szDest, FALSE);
-            DeleteFileW(m_szBodyFile);
-            m_szBodyFile[0] = 0;
-        }
-        else
-        {
-            ScopedHandle hDst(CreateFileW(szDest, GENERIC_WRITE, 0, NULL,
-                                          CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL));
-            if (hDst.Valid())
-            {
-                DWORD cbWritten = 0;
-                bOk = WriteFile(hDst.Get(), m_body.data, m_body.size,
-                                &cbWritten, NULL) && cbWritten == m_body.size;
-            }
-            if (!bOk) DeleteFileW(szDest);
-        }
-
-        // ------------------------------------------------------------------
-        //  4. Build an HTML status page.  Reuse the in-memory (m_isError)
-        //     read path — the content is not an error, but the mechanism
-        //     is identical.
-        // ------------------------------------------------------------------
-        m_body.Free();
-        m_isError = true;  // tell Read() to serve from m_body
-        m_pos     = 0;
-
-        // Convert wide path to UTF-8 for embedding in HTML.
-        char szDestA[MAX_PATH * 3] = "";
-        WideCharToMultiByte(CP_UTF8, 0, szDest, -1,
-                            szDestA, sizeof(szDestA), NULL, NULL);
-        char szNameA[MAX_PATH * 3] = "";
-        WideCharToMultiByte(CP_UTF8, 0, szName, -1,
-                            szNameA, sizeof(szNameA), NULL, NULL);
-
-        if (bOk)
-        {
-            m_body.AppendStr(
-                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                "<title>Download Complete</title>"
-                "<style>"
-                "body{font-family:Tahoma,Arial,sans-serif;margin:40px;background:#f0f0f0}"
-                ".box{background:#fff;border:1px solid #ccc;padding:24px 32px;"
-                "max-width:560px;margin:auto}"
-                "h2{margin-top:0;color:#006400}"
-                ".path{font-family:monospace;background:#eee;padding:6px 8px;"
-                "word-break:break-all;border:1px solid #ccc}"
-                "</style></head><body><div class='box'>"
-                "<h2>Download complete</h2>"
-                "<p><b>File:</b> ");
-            m_body.AppendStr(szNameA);
-            m_body.AppendStr(
-                "</p>"
-                "<p><b>Saved to:</b></p>"
-                "<div class='path'>");
-            m_body.AppendStr(szDestA);
-            m_body.AppendStr(
-                "</div>"
-                "</div></body></html>");
-        }
-        else
-        {
-            m_body.AppendStr(
-                "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-                "<title>Download Failed</title></head><body>"
-                "<h2>Download failed</h2>"
-                "<p>The file was downloaded to a temporary location "
-                "but could not be moved to the download folder.</p>"
-                "<p>Temporary path: ");
-            m_body.AppendStr(szDestA);
-            m_body.AppendStr("</p></body></html>");
-        }
-
-        pszMime = L"text/html";
-    }
-
-    m_sink->ReportProgress(BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE, pszMime);
+    sink->ReportProgress(BINDSTATUS_MIMETYPEAVAILABLE, pszMime);
+    sink->ReportProgress(BINDSTATUS_VERIFIEDMIMETYPEAVAILABLE, pszMime);
     if (pszSniffed) CoTaskMemFree(pszSniffed);
+}
 
-    // 2. Tell URLMon how much data is available.
-    ULONG cbTotal = m_isError ? m_body.size
-        : m_hBodyFile.Valid() ? (m_bodyFileSize > MAXDWORD ? MAXDWORD : (ULONG)m_bodyFileSize)
-        : m_body.size;
+STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
+{
+    BYTE  sniffBuf[512];
+    DWORD cbSniff = 0;
 
-    m_sink->ReportData(BSCF_FIRSTDATANOTIFICATION
-                     | BSCF_LASTDATANOTIFICATION
-                     | BSCF_DATAFULLYAVAILABLE,
-                       cbTotal, cbTotal);
+    Lock();
+    if (!m_sink || m_bAbort)
+    {
+        Unlock();
+        return S_OK;
+    }
+    CComPtr<IInternetProtocolSink> sink = m_sink;
+    m_bNotifyPending = false;
+    WCHAR szCache[MAX_PATH];
+    szCache[0] = 0;
+    if (m_szCache[0] && !m_bCacheReported)
+    {
+        lstrcpynW(szCache, m_szCache, _countof(szCache));
+        m_bCacheReported = true;
+    }
+    const ULONGLONG received = m_received;
+    const bool      done     = m_bDone;
+    if (!m_bReported)
+    {
+        DWORD avail = m_buf.size - m_bufPos;
+        cbSniff = avail < sizeof(sniffBuf) ? avail : sizeof(sniffBuf);
+        memcpy(sniffBuf, m_buf.data + m_bufPos, cbSniff);
+    }
+    Unlock();
 
-    // 3. Mark the bind as complete.
-    m_sink->ReportResult(S_OK, m_status, NULL);
+    if (szCache[0])
+        sink->ReportProgress(BINDSTATUS_CACHEFILENAMEAVAILABLE, szCache);
+
+    DWORD flags = done ? (BSCF_LASTDATANOTIFICATION | BSCF_DATAFULLYAVAILABLE)
+                       : BSCF_INTERMEDIATEDATANOTIFICATION;
+    if (!m_bReported)
+    {
+        m_bReported = true;
+        ReportHeaders(sink, sniffBuf, cbSniff);
+        flags |= BSCF_FIRSTDATANOTIFICATION;
+    }
+
+    // Progress max is the final size when known; compressed responses only
+    // advertise the encoded length, so they report an unknown total.
+    ULONGLONG total = 0;
+    if (done)
+        total = received;
+    else if (!m_isError && !m_hasEncoding && m_contentLength != (ULONGLONG)-1)
+        total = m_contentLength;
+    sink->ReportData(flags,
+                     received > MAXDWORD ? MAXDWORD : (ULONG)received,
+                     total    > MAXDWORD ? MAXDWORD : (ULONG)total);
+
+    if (done)
+    {
+        Lock();
+        const bool    claim = !m_bResultReported && !m_bAbort;
+        const HRESULT hr    = m_hrResult;
+        m_bResultReported = true;
+        Unlock();
+        if (claim)
+            sink->ReportResult(hr, m_status, NULL);
+    }
     return S_OK;
 }
 
@@ -932,25 +1155,141 @@ STDMETHODIMP CurlProtocol::Read(void* pv, ULONG cb, ULONG* pcbRead)
         return E_POINTER;
     *pcbRead = 0;
 
-    // Large spill response: stream from the temp file.
-    if (!m_isError && m_hBodyFile.Valid())
+    Lock();
+    HRESULT hr;
+    DWORD avail = m_buf.size - m_bufPos;
+    if (avail == 0)
     {
-        DWORD cbRead = 0;
-        if (!ReadFile(m_hBodyFile.Get(), pv, cb, &cbRead, NULL))
-            return S_FALSE;
-        *pcbRead = cbRead;
-        return (cbRead == 0) ? S_FALSE : S_OK;
+        hr = m_bDone ? S_FALSE : E_PENDING;
+    }
+    else
+    {
+        DWORD n = cb < avail ? cb : avail;
+        memcpy(pv, m_buf.data + m_bufPos, n);
+        m_bufPos += n;
+        *pcbRead  = n;
+        if (m_bufPos == m_buf.size)
+        {
+            m_buf.size = 0;
+            m_bufPos   = 0;
+        }
+        else if (m_bufPos >= kCompactAt)
+        {
+            memmove(m_buf.data, m_buf.data + m_bufPos, m_buf.size - m_bufPos);
+            m_buf.size -= m_bufPos;
+            m_bufPos    = 0;
+        }
+        hr = (m_buf.size == 0 && m_bDone) ? S_FALSE : S_OK;
+        SetEvent(m_hRoom.Get());
+    }
+    Unlock();
+    return hr;
+}
+
+// Finds a header in m_rawHeaders (status line skipped).
+bool CurlProtocol::FindHeader(const char* name, const char** pv, DWORD* pn) const
+{
+    const char* p    = (const char*)m_rawHeaders.data;
+    const char* pEnd = p + m_rawHeaders.size;
+    const DWORD nameLen = lstrlenA(name);
+    while (p < pEnd)
+    {
+        const char* lineEnd = p;
+        while (lineEnd < pEnd && *lineEnd != '\r') ++lineEnd;
+        if (p != (const char*)m_rawHeaders.data)
+        {
+            if (const char* v = MatchHdr(p, (DWORD)(lineEnd - p), lineEnd, name, nameLen))
+            {
+                *pv = v;
+                *pn = (DWORD)(lineEnd - v);
+                return true;
+            }
+        }
+        p = lineEnd + 2;
+    }
+    return false;
+}
+
+// HttpQueryInfo semantics: ANSI text, or a DWORD with HTTP_QUERY_FLAG_NUMBER.
+STDMETHODIMP CurlProtocol::QueryInfo(DWORD dwOption, LPVOID pBuffer, DWORD* pcbBuf,
+                                     DWORD* pdwFlags, DWORD*)
+{
+    if (!pcbBuf)
+        return E_INVALIDARG;
+    if (pdwFlags) *pdwFlags = 0;
+    if (dwOption & HTTP_QUERY_FLAG_REQUEST_HEADERS)
+    {
+        SetLastError(ERROR_HTTP_HEADER_NOT_FOUND);
+        return HRESULT_FROM_WIN32(ERROR_HTTP_HEADER_NOT_FOUND);
     }
 
-    // In-memory path: error pages and small responses.
-    if (m_pos >= m_body.size)
-        return S_FALSE;
-    DWORD avail  = m_body.size - m_pos;
-    DWORD toCopy = (cb < avail) ? cb : avail;
-    memcpy(pv, m_body.data + m_pos, toCopy);
-    m_pos    += toCopy;
-    *pcbRead  = toCopy;
-    return (m_pos < m_body.size) ? S_OK : S_FALSE;
+    Lock();
+    const bool have = m_bHeaders;
+    Unlock();
+
+    const char* v = NULL;
+    DWORD       n = 0;
+    char        num[16];
+    if (have)
+    {
+        switch (dwOption & HTTP_QUERY_HEADER_MASK)
+        {
+            case HTTP_QUERY_RAW_HEADERS_CRLF:
+                v = (const char*)m_rawHeaders.data;
+                n = m_rawHeaders.size;
+                break;
+            case HTTP_QUERY_STATUS_CODE:
+                n = wsprintfA(num, "%u", m_status);
+                v = num;
+                break;
+            case HTTP_QUERY_CONTENT_DISPOSITION:
+                FindHeader("Content-Disposition", &v, &n);
+                break;
+            case HTTP_QUERY_CONTENT_TYPE:
+                FindHeader("Content-Type", &v, &n);
+                break;
+            case HTTP_QUERY_CONTENT_LENGTH:
+                FindHeader("Content-Length", &v, &n);
+                break;
+            case HTTP_QUERY_CACHE_CONTROL:
+                FindHeader("Cache-Control", &v, &n);
+                break;
+            case HTTP_QUERY_PRAGMA:
+                FindHeader("Pragma", &v, &n);
+                break;
+        }
+    }
+    if (!v)
+    {
+        SetLastError(ERROR_HTTP_HEADER_NOT_FOUND);
+        return HRESULT_FROM_WIN32(ERROR_HTTP_HEADER_NOT_FOUND);
+    }
+
+    if (dwOption & HTTP_QUERY_FLAG_NUMBER)
+    {
+        if (!pBuffer || *pcbBuf < sizeof(DWORD))
+        {
+            *pcbBuf = sizeof(DWORD);
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+        }
+        DWORD d = 0;
+        for (DWORD i = 0; i < n && v[i] >= '0' && v[i] <= '9'; ++i)
+            d = d * 10 + (DWORD)(v[i] - '0');
+        *(DWORD*)pBuffer = d;
+        *pcbBuf = sizeof(DWORD);
+        return S_OK;
+    }
+    if (!pBuffer || *pcbBuf < n + 1)
+    {
+        *pcbBuf = n + 1;
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+    }
+    memcpy(pBuffer, v, n);
+    ((char*)pBuffer)[n] = 0;
+    *pcbBuf = n + 1;
+    return S_OK;
 }
 
 // ---------------------------------------------------------------------------

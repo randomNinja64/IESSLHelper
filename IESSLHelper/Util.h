@@ -20,6 +20,7 @@ public:
     bool   Valid() const { return m_h != NULL && m_h != INVALID_HANDLE_VALUE; }
     void   Close() { if (Valid()) CloseHandle(m_h); m_h = INVALID_HANDLE_VALUE; }
     void   Attach(HANDLE h) { Close(); m_h = h; }
+    HANDLE Detach() { HANDLE h = m_h; m_h = INVALID_HANDLE_VALUE; return h; }
 
 private:
     HANDLE m_h;

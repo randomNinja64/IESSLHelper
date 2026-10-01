@@ -4,9 +4,10 @@
 
 // ---------------------------------------------------------------------------
 // CurlRunner - launches curl.exe to perform a single HTTP(S) request.
-// Response body is piped into pStdoutOut (in memory) for small responses;
-// once kSpillThreshold is exceeded it spills into pszSpillFile instead.
-// Stderr is always captured via a pipe into pStderrOut.
+// curl is run with -i, so stdout carries the response headers followed by
+// the body.  The caller reads stdout while curl runs.  Stderr is drained
+// on a side thread from launch, so a full pipe cannot stall curl.
+// FinishCurl returns the exit code and that stderr.
 // ---------------------------------------------------------------------------
 
 namespace curlbho {
@@ -15,20 +16,11 @@ namespace curlbho {
 // (defined in the header so it can be used as a case label in other TUs)
 static const DWORD FETCH_LAUNCH_FAILED = 0xFFFFFFFE;
 
-// Responses smaller than this stay in pStdoutOut (in memory).
-// Larger responses spill to pszSpillFile so downloads don't hit a cap.
-static const DWORD kSpillThreshold = 16777216; // 16 MiB
-
-// Parameters passed to RunCurl.
+// Parameters passed to StartCurl.
 struct CurlRequest
 {
     LPCWSTR     pszURL;
-    Bytes*      pStdoutOut;       // receives body when response <= kSpillThreshold
-    LPCWSTR     pszSpillFile;     // if non-NULL, large responses are written here instead
-    bool*       pDidSpill;        // out: set to true if pszSpillFile was used
-    Bytes*      pStderrOut;       // receives stderr bytes; may be NULL
-    LPCWSTR     pszHeaderFile;    // if non-NULL, response headers are dumped here (-D)
-    const BYTE* pCookieJar;      // if non-NULL, Netscape cookie lines served on a pipe
+    const BYTE* pCookieJar;       // if non-NULL, Netscape cookie lines served on a pipe
     DWORD       cbCookieJar;
     LPCWSTR     pszVerb;          // NULL / empty -> GET
     LPCWSTR     pszContentType;   // NULL -> not forwarded
@@ -37,7 +29,24 @@ struct CurlRequest
     DWORD       cbPostData;
 };
 
-// Returns the curl process exit code, or FETCH_LAUNCH_FAILED.
-DWORD RunCurl(const CurlRequest& req);
+// A running curl.exe.  hOut is the read end of its stdout.
+// stderr is filled by the drain thread; hErr is not used after launch.
+struct CurlProcess
+{
+    HANDLE hProcess;
+    HANDLE hOut;
+    HANDLE hErr;
+    HANDLE hStderrThread;
+    Bytes  errBytes;   // "stderr" is a CRT macro
+};
+
+// Launches curl and serves the cookie and POST pipes.  False if curl could
+// not be started; proc is then left empty.
+bool StartCurl(const CurlRequest& req, CurlProcess* proc);
+
+// Waits for the stderr drain and for curl to exit, copies stderr into
+// pStderrOut (may be NULL), and closes every handle in proc.
+// Returns curl's exit code.
+DWORD FinishCurl(CurlProcess* proc, Bytes* pStderrOut);
 
 } // namespace curlbho
