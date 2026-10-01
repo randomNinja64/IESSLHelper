@@ -26,8 +26,6 @@ struct CurlRequest
     LPCWSTR     pszExtraHeaders;  // NULL or \r\n-delimited extra headers
     const BYTE* pPostData;        // NULL -> no request body
     DWORD       cbPostData;
-    LPCWSTR     pszUser;          // "name:password", or NULL
-    LPCWSTR     pszProxyUser;     // "name:password", or NULL
 };
 
 // A running curl.exe.  hOut is the read end of its stdout.

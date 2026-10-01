@@ -1,6 +1,5 @@
 #include "stdafx.h"
 #include "CurlRunner.h"
-#include <winhttp.h>
 #include "Util.h"
 
 extern HMODULE g_hModule; // defined in dllmain.cpp
@@ -152,205 +151,6 @@ static bool AppendHeaderLine(WCHAR* szCmd, int* pcch, LPCWSTR line, int len)
     return true;
 }
 
-static bool AppendLit(WCHAR* szCmd, int* pcch, LPCWSTR text)
-{
-    int n = lstrlenW(text);
-    if (*pcch > kCmdMax - 1 - n)
-        return false;
-    lstrcpyW(szCmd + *pcch, text);
-    *pcch += n;
-    return true;
-}
-
-// Copies one IE proxy token (up to ';' ) and drops quotes and line breaks.
-static void CopyProxyToken(const WCHAR* src, WCHAR* dst, int cch)
-{
-    int n = 0;
-    while (src && *src && *src != L';' && n < cch - 1)
-    {
-        if (*src != L'"' && *src != L'\r' && *src != L'\n')
-            dst[n++] = *src;
-        ++src;
-    }
-    while (n > 0 && (dst[n - 1] == L' ' || dst[n - 1] == L'\t'))
-        --n;
-    dst[n] = 0;
-}
-
-// "https=host:port;http=host:port", or a bare "host:port". HTTPS uses the
-// https= entry, then http=, then a bare host. curl wants a scheme.
-static void CurlProxyUrl(LPCWSTR src, WCHAR* dst, int cch)
-{
-    dst[0] = 0;
-    if (!src || !src[0] || cch < 8)
-        return;
-    const WCHAR* tok = NULL;
-    for (const WCHAR* p = src; *p; )
-    {
-        if (_wcsnicmp(p, L"https=", 6) == 0) { tok = p + 6; break; }
-        if (!tok && _wcsnicmp(p, L"http=", 5) == 0) tok = p + 5;
-        while (*p && *p != L';') ++p;
-        if (*p == L';') ++p;
-    }
-    WCHAR host[256];
-    if (tok)
-        CopyProxyToken(tok, host, _countof(host));
-    else if (!wcschr(src, L'='))
-        CopyProxyToken(src, host, _countof(host));
-    else
-        host[0] = 0;
-    if (!host[0])
-        return;
-    bool hasScheme = wcsstr(host, L"://") != NULL;
-    if (!hasScheme)
-    {
-        lstrcpynW(dst, L"http://", cch);
-        lstrcpynW(dst + 7, host, cch - 7);
-    }
-    else
-        lstrcpynW(dst, host, cch);
-    // user:pass@ stays off the command line. A 407 uses the config pipe.
-    WCHAR* scheme = wcsstr(dst, L"://");
-    WCHAR* at = scheme ? wcschr(scheme + 3, L'@') : NULL;
-    if (at)
-    {
-        int keep = (int)(scheme + 3 - dst);
-        memmove(dst + keep, at + 1, (lstrlenW(at + 1) + 1) * sizeof(WCHAR));
-    }
-}
-
-// IE separates the bypass list with semicolons. curl wants commas.
-static void BypassToNoProxy(LPCWSTR src, WCHAR* dst, int cch)
-{
-    int n = 0;
-    for (; src && *src && n < cch - 1; ++src)
-    {
-        if (*src == L';')
-            dst[n++] = L',';
-        else if (*src != L' ' && *src != L'\t' && *src != L'"' &&
-                 *src != L'\r' && *src != L'\n')
-            dst[n++] = *src;
-    }
-    dst[n] = 0;
-}
-
-static void FreeProxyStr(LPWSTR p)
-{
-    if (p) GlobalFree(p);
-}
-
-// Fills szProxy ("http://host:port") and szNoProxy from IE's settings for
-// this URL. Both are empty when IE would connect directly.
-static void LookupIeProxy(LPCWSTR pszURL, WCHAR* szProxy, int cchProxy,
-                          WCHAR* szNoProxy, int cchNoProxy)
-{
-    szProxy[0] = szNoProxy[0] = 0;
-    WINHTTP_CURRENT_USER_IE_PROXY_CONFIG cfg;
-    ZeroMemory(&cfg, sizeof(cfg));
-    if (!WinHttpGetIEProxyConfigForCurrentUser(&cfg))
-        return;
-
-    WINHTTP_PROXY_INFO info;
-    ZeroMemory(&info, sizeof(info));
-    BOOL resolved = FALSE;
-    if (cfg.fAutoDetect || (cfg.lpszAutoConfigUrl && cfg.lpszAutoConfigUrl[0]))
-    {
-        HINTERNET hSession = WinHttpOpen(L"IESSLHelper",
-            WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_NO_PROXY_NAME,
-            WINHTTP_NO_PROXY_BYPASS, 0);
-        if (hSession)
-        {
-            WINHTTP_AUTOPROXY_OPTIONS opt;
-            ZeroMemory(&opt, sizeof(opt));
-            if (cfg.fAutoDetect)
-            {
-                opt.dwFlags |= WINHTTP_AUTOPROXY_AUTO_DETECT;
-                opt.dwAutoDetectFlags = WINHTTP_AUTO_DETECT_TYPE_DHCP |
-                                        WINHTTP_AUTO_DETECT_TYPE_DNS_A;
-            }
-            if (cfg.lpszAutoConfigUrl && cfg.lpszAutoConfigUrl[0])
-            {
-                opt.dwFlags |= WINHTTP_AUTOPROXY_CONFIG_URL;
-                opt.lpszAutoConfigUrl = cfg.lpszAutoConfigUrl;
-            }
-            opt.fAutoLogonIfChallenged = TRUE;
-            resolved = WinHttpGetProxyForUrl(hSession, pszURL, &opt, &info);
-            WinHttpCloseHandle(hSession);
-        }
-    }
-
-    LPCWSTR proxy = NULL;
-    LPCWSTR bypass = NULL;
-    if (resolved && info.dwAccessType == WINHTTP_ACCESS_TYPE_NAMED_PROXY)
-    {
-        proxy = info.lpszProxy;
-        bypass = info.lpszProxyBypass;
-    }
-    else if (!resolved && cfg.lpszProxy && cfg.lpszProxy[0])
-    {
-        proxy = cfg.lpszProxy;
-        bypass = cfg.lpszProxyBypass;
-    }
-    if (proxy)
-        CurlProxyUrl(proxy, szProxy, cchProxy);
-    if (szProxy[0] && bypass)
-        BypassToNoProxy(bypass, szNoProxy, cchNoProxy);
-
-    FreeProxyStr(info.lpszProxy);
-    FreeProxyStr(info.lpszProxyBypass);
-    FreeProxyStr(cfg.lpszAutoConfigUrl);
-    FreeProxyStr(cfg.lpszProxy);
-    FreeProxyStr(cfg.lpszProxyBypass);
-}
-
-// curl config for --anyauth / --proxy-anyauth. Quotes and backslashes are
-// escaped, and line breaks are dropped so a password cannot add a line.
-static char* BuildAuthConfig(LPCWSTR user, LPCWSTR proxyUser, DWORD* pcb)
-{
-    *pcb = 0;
-    int cap = 64;
-    if (user) cap += lstrlenW(user) * 4 + 16;
-    if (proxyUser) cap += lstrlenW(proxyUser) * 4 + 32;
-    char* dst = (char*)LocalAlloc(LMEM_FIXED, cap);
-    if (!dst)
-        return NULL;
-    int at = 0;
-    const LPCWSTR vals[2] = { user, proxyUser };
-    const char* keys[2] = { "user = \"", "proxy-user = \"" };
-    for (int k = 0; k < 2; ++k)
-    {
-        if (!vals[k])
-            continue;
-        int klen = lstrlenA(keys[k]);
-        if (at + klen >= cap) break;
-        memcpy(dst + at, keys[k], klen);
-        at += klen;
-        int wlen = lstrlenW(vals[k]);
-        int n = WideCharToMultiByte(CP_ACP, 0, vals[k], wlen, NULL, 0, NULL, NULL);
-        char* tmp = n > 0 ? (char*)LocalAlloc(LMEM_FIXED, n) : NULL;
-        if (tmp)
-            WideCharToMultiByte(CP_ACP, 0, vals[k], wlen, tmp, n, NULL, NULL);
-        for (int i = 0; tmp && i < n && at + 2 < cap; ++i)
-        {
-            char c = tmp[i];
-            if (c == '\r' || c == '\n')
-                continue;
-            if (c == '"' || c == '\\')
-                dst[at++] = '\\';
-            dst[at++] = c;
-        }
-        if (tmp) LocalFree(tmp);
-        if (at + 2 < cap)
-        {
-            dst[at++] = '"';
-            dst[at++] = '\n';
-        }
-    }
-    dst[at] = 0;
-    *pcb = (DWORD)at;
-    return dst;
-}
-
 bool StartCurl(const CurlRequest& req, CurlProcess* proc)
 {
     proc->hProcess = NULL;
@@ -372,40 +172,10 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     HANDLE hPipe          = INVALID_HANDLE_VALUE;
     WCHAR  szCookiePipe[96] = L"";
     HANDLE hCookiePipe      = INVALID_HANDLE_VALUE;
-    WCHAR  szConfigPipe[96] = L"";
-    HANDLE hConfigPipe      = INVALID_HANDLE_VALUE;
-    DWORD  cbConfig         = 0;
-    char*  pConfig          = NULL;
 
     static LONG s_seq = 0;
     const bool bHasBody = (req.pPostData != NULL && req.cbPostData > 0);
     const bool bHasCookies = (req.pCookieJar != NULL && req.cbCookieJar > 0);
-    const bool bHasConfig = (req.pszUser && req.pszUser[0]) ||
-                            (req.pszProxyUser && req.pszProxyUser[0]);
-
-    if (bHasConfig)
-    {
-        pConfig = BuildAuthConfig(req.pszUser, req.pszProxyUser, &cbConfig);
-        if (!pConfig || cbConfig == 0)
-        {
-            if (pConfig) LocalFree(pConfig);
-            return false;
-        }
-        LONG seq = InterlockedIncrement(&s_seq);
-        wsprintfW(szConfigPipe,
-            L"\\\\.\\pipe\\curlbho_au_%08X_%08X",
-            GetCurrentProcessId(), (DWORD)seq);
-        hConfigPipe = CreateNamedPipeW(
-            szConfigPipe,
-            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, 0, cbConfig + 1, 0, NULL);
-        if (hConfigPipe == INVALID_HANDLE_VALUE)
-        {
-            LocalFree(pConfig);
-            return false;
-        }
-    }
 
     if (bHasCookies)
     {
@@ -421,11 +191,7 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
             1, 0, req.cbCookieJar + 1, 0, NULL);
 
         if (hCookiePipe == INVALID_HANDLE_VALUE)
-        {
-            if (hConfigPipe != INVALID_HANDLE_VALUE) CloseHandle(hConfigPipe);
-            if (pConfig) LocalFree(pConfig);
             return false;
-        }
     }
 
     if (bHasBody)
@@ -447,9 +213,7 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
 
         if (hPipe == INVALID_HANDLE_VALUE)
         {
-            if (hConfigPipe != INVALID_HANDLE_VALUE) CloseHandle(hConfigPipe);
             if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
-            if (pConfig) LocalFree(pConfig);
             return false;
         }
     }
@@ -461,10 +225,8 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     WCHAR* szCmd = (WCHAR*)LocalAlloc(LMEM_FIXED, kCmdMax * sizeof(WCHAR));
     if (!szCmd)
     {
-        if (hConfigPipe != INVALID_HANDLE_VALUE) CloseHandle(hConfigPipe);
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        if (pConfig) LocalFree(pConfig);
         return false;
     }
     int cch = 0;
@@ -483,21 +245,6 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     bool bCmd = AppendArg(szCmd, &cch,
         L"\"%s\" -i --ssl-no-revoke --compressed -sS --connect-timeout 30",
         szCurl);
-
-    WCHAR szProxy[512];
-    WCHAR szNoProxy[2048];
-    LookupIeProxy(req.pszURL, szProxy, _countof(szProxy),
-                  szNoProxy, _countof(szNoProxy));
-    if (bCmd && szProxy[0])
-        bCmd = AppendArg(szCmd, &cch, L" --proxy \"%s\"", szProxy);
-    if (bCmd && szNoProxy[0])
-        bCmd = AppendArg(szCmd, &cch, L" --noproxy \"%s\"", szNoProxy);
-    if (bCmd && req.pszUser && req.pszUser[0])
-        bCmd = AppendLit(szCmd, &cch, L" --anyauth");
-    if (bCmd && req.pszProxyUser && req.pszProxyUser[0])
-        bCmd = AppendLit(szCmd, &cch, L" --proxy-anyauth");
-    if (bCmd && szConfigPipe[0])
-        bCmd = AppendArg(szCmd, &cch, L" --config \"%s\"", szConfigPipe);
 
     // No '=' in the pipe path, so curl opens it as a cookie file. The
     // bytes stay in the pipe's memory buffer; curl reads them at startup.
@@ -542,10 +289,8 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     if (!bCmd)
     {
         LocalFree(szCmd);
-        if (hConfigPipe != INVALID_HANDLE_VALUE) CloseHandle(hConfigPipe);
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        if (pConfig) LocalFree(pConfig);
         return false;
     }
 
@@ -603,20 +348,13 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
 
     if (!bOk)
     {
-        if (hConfigPipe != INVALID_HANDLE_VALUE) CloseHandle(hConfigPipe);
         if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
         if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
-        if (pConfig) LocalFree(pConfig);
         return false;
     }
     CloseHandle(pi.hThread);
 
-    // Config first: curl reads it at startup, before the cookie jar.
-    if (hConfigPipe != INVALID_HANDLE_VALUE)
-        ServePipe(hConfigPipe, pi.hProcess, pConfig, cbConfig);
-    if (pConfig) LocalFree(pConfig);
-
-    // Cookie file next: curl reads it at startup, before the request body.
+    // Cookie file first: curl reads it at startup, before the request body.
     if (bHasCookies && hCookiePipe != INVALID_HANDLE_VALUE)
         ServePipe(hCookiePipe, pi.hProcess, req.pCookieJar, req.cbCookieJar);
 
