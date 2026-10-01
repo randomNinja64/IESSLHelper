@@ -1487,35 +1487,48 @@ const CLSID CLSID_CurlProtocol =
 // ===========================================================================
 //  Public Register / Unregister.  Reference counted so multiple BHO
 //  instances in the same process share a single namespace registration.
+//  The lock covers the count and the URLMon call, so a last Unregister
+//  cannot pass a new Register.
 // ===========================================================================
+
+static struct RegLock
+{
+    CRITICAL_SECTION cs;
+    RegLock()  { InitializeCriticalSection(&cs); }
+    ~RegLock() { DeleteCriticalSection(&cs); }
+} g_regLock;
 
 HRESULT RegisterCurlProtocol()
 {
-    if (InterlockedIncrement(&g_registerCount) > 1)
-        return S_OK;
-
-    CComPtr<IInternetSession> spSession;
-    HRESULT hr = CoInternetGetSession(0, &spSession, 0);
-    if (SUCCEEDED(hr))
+    EnterCriticalSection(&g_regLock.cs);
+    HRESULT hr = S_OK;
+    if (++g_registerCount <= 1)
     {
-        hr = spSession->RegisterNameSpace(&g_factory, CLSID_CurlProtocol,
-                                          L"https", 0, NULL, 0);
+        CComPtr<IInternetSession> spSession;
+        hr = CoInternetGetSession(0, &spSession, 0);
+        if (SUCCEEDED(hr))
+        {
+            hr = spSession->RegisterNameSpace(&g_factory, CLSID_CurlProtocol,
+                                              L"https", 0, NULL, 0);
+        }
+        if (FAILED(hr))
+            --g_registerCount;
     }
-    if (FAILED(hr))
-        InterlockedDecrement(&g_registerCount);
+    LeaveCriticalSection(&g_regLock.cs);
     return hr;
 }
 
 HRESULT UnregisterCurlProtocol()
 {
-    if (InterlockedDecrement(&g_registerCount) > 0)
-        return S_OK;
-
-    CComPtr<IInternetSession> spSession;
-    HRESULT hr = CoInternetGetSession(0, &spSession, 0);
-    if (SUCCEEDED(hr))
+    EnterCriticalSection(&g_regLock.cs);
+    HRESULT hr = S_OK;
+    if (--g_registerCount <= 0)
     {
-        hr = spSession->UnregisterNameSpace(&g_factory, L"https");
+        CComPtr<IInternetSession> spSession;
+        hr = CoInternetGetSession(0, &spSession, 0);
+        if (SUCCEEDED(hr))
+            hr = spSession->UnregisterNameSpace(&g_factory, L"https");
     }
+    LeaveCriticalSection(&g_regLock.cs);
     return hr;
 }
