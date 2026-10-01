@@ -718,6 +718,24 @@ void CurlProtocol::Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrByt
     if (sink) SwitchTo(sink);
 }
 
+// Curl blocks if either pipe fills.  Stdout is read on this thread, so
+// stderr has to be read at the same time.
+struct StderrRead
+{
+    HANDLE hErr;
+    Bytes* out;
+};
+
+static DWORD WINAPI StderrReadProc(LPVOID p)
+{
+    StderrRead* r = static_cast<StderrRead*>(p);
+    BYTE buf[4096];
+    DWORD n = 0;
+    while (ReadFile(r->hErr, buf, sizeof(buf), &n, NULL) && n > 0)
+        r->out->Append(buf, n);
+    return 0;
+}
+
 DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
 {
     CurlProtocol* self = static_cast<CurlProtocol*>(p);
@@ -768,6 +786,18 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         self->m_hProcess = proc.hProcess;
         if (self->m_bAbort) self->KillCurl();
         self->Unlock();
+
+        stderrBytes.Free();
+        StderrRead errRead;
+        errRead.hErr = proc.hErr;
+        errRead.out  = &stderrBytes;
+        HANDLE hErrThread = CreateThread(NULL, 0, StderrReadProc, &errRead, 0, NULL);
+        if (!hErrThread && proc.hErr != INVALID_HANDLE_VALUE)
+        {
+            // Losing the error text is better than a full pipe stalling curl.
+            CloseHandle(proc.hErr);
+            proc.hErr = INVALID_HANDLE_VALUE;
+        }
 
         Bytes head;
         bool  stop   = false;
@@ -840,14 +870,23 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         self->m_hProcess = NULL;
         self->Unlock();
 
+        // Kill first when the body was abandoned, so this wait cannot sit
+        // behind a curl that is blocked on a full stdout pipe.
+        if (hErrThread)
+        {
+            WaitForSingleObject(hErrThread, INFINITE);
+            CloseHandle(hErrThread);
+        }
+
         if (follow)
         {
-            curlbho::FinishCurl(&proc, NULL);
+            stderrBytes.Free();
+            curlbho::FinishCurl(&proc);
             self->ClearHopHeaders();
             continue;
         }
 
-        dwExit = curlbho::FinishCurl(&proc, &stderrBytes);
+        dwExit = curlbho::FinishCurl(&proc);
         break;
     }
 

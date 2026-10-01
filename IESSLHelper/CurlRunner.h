@@ -5,9 +5,8 @@
 // ---------------------------------------------------------------------------
 // CurlRunner - launches curl.exe to perform a single HTTP(S) request.
 // curl is run with -i, so stdout carries the response headers followed by
-// the body.  The caller reads stdout while curl runs.  Stderr is drained
-// on a side thread from launch, so a full pipe cannot stall curl.
-// FinishCurl returns the exit code and that stderr.
+// the body.  The caller reads stdout and stderr together while curl
+// runs, then calls FinishCurl for the exit code.
 // ---------------------------------------------------------------------------
 
 namespace curlbho {
@@ -30,23 +29,19 @@ struct CurlRequest
 };
 
 // A running curl.exe.  hOut is the read end of its stdout.
-// stderr is filled by the drain thread; hErr is not used after launch.
 struct CurlProcess
 {
     HANDLE hProcess;
     HANDLE hOut;
     HANDLE hErr;
-    HANDLE hStderrThread;
-    Bytes  errBytes;   // "stderr" is a CRT macro
 };
 
 // Launches curl and serves the cookie and POST pipes.  False if curl could
 // not be started; proc is then left empty.
 bool StartCurl(const CurlRequest& req, CurlProcess* proc);
 
-// Waits for the stderr drain and for curl to exit, copies stderr into
-// pStderrOut (may be NULL), and closes every handle in proc.
-// Returns curl's exit code.
-DWORD FinishCurl(CurlProcess* proc, Bytes* pStderrOut);
+// Waits for curl to exit and closes every handle in proc.  The caller
+// drains stderr while curl is running.  Returns curl's exit code.
+DWORD FinishCurl(CurlProcess* proc);
 
 } // namespace curlbho
