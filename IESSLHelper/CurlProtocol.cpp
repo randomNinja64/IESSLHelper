@@ -145,7 +145,8 @@ public:
     END_COM_MAP()
 
     CurlProtocol() : m_pos(0), m_isError(false), m_bodyFileSize(0),
-                     m_isAttachment(false), m_status(200)
+                     m_isAttachment(false), m_status(200),
+                     m_bAbort(false), m_bReady(false)
     {
         m_szBodyFile[0]   = 0;
         m_szHeaderFile[0] = 0;
@@ -156,8 +157,8 @@ public:
     STDMETHOD(Start)(LPCWSTR szURL, IInternetProtocolSink* pSink,
                      IInternetBindInfo* pBindInfo, DWORD grfPI, HANDLE_PTR);
     STDMETHOD(Continue)(PROTOCOLDATA* pProtocolData);
-    STDMETHOD(Abort)(HRESULT, DWORD)        { return S_OK; }
-    STDMETHOD(Terminate)(DWORD)             { CloseAndDeleteBodyFile(); DeleteHeaderFile(); m_body.Free(); m_sink.Release(); return S_OK; }
+    STDMETHOD(Abort)(HRESULT hrReason, DWORD);
+    STDMETHOD(Terminate)(DWORD);
     STDMETHOD(Suspend)()                    { return E_NOTIMPL; }
     STDMETHOD(Resume)()                     { return E_NOTIMPL; }
 
@@ -220,6 +221,11 @@ private:
     CComBSTR                       m_dispositionFilename;   // filename= / filename*= value
     bool                           m_isAttachment;          // CD says "attachment"
     DWORD                          m_status;                // final HTTP status code
+
+    // Guarded by Lock(). Until m_bReady, the worker owns the response
+    // fields; Abort/Terminate only set m_bAbort and leave cleanup to it.
+    bool                           m_bAbort;
+    bool                           m_bReady;
 };
 
 DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
@@ -451,36 +457,79 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     }
     if (szHdr[0]) DeleteFileW(szHdr);
 
-    // Redirects are followed by URLMon, not curl, so each hop's Set-Cookie
-    // reaches WinInet before the next request reads it.  These are the
-    // codes IE6 follows.
-    const DWORD st = self->m_status;
-    if (!self->m_isError && szLocation[0] &&
-        (st == 301 || st == 302 || st == 303 || st == 307))
+    // Hand the response to the apartment thread, unless the bind was
+    // aborted while curl ran. In that case nothing else will free it.
+    CComPtr<IInternetProtocolSink> sink;
+    self->Lock();
+    const bool bAborted = self->m_bAbort;
+    if (bAborted)
     {
+        self->CloseAndDeleteBodyFile();
+        self->m_body.Free();
+    }
+    else
+    {
+        self->m_bReady = true;
+        sink = self->m_sink;
+    }
+    self->Unlock();
+
+    if (!bAborted && sink)
+    {
+        // Redirects are followed by URLMon, not curl, so each hop's
+        // Set-Cookie reaches WinInet before the next request reads it.
+        // These are the codes IE6 follows.
+        const DWORD st = self->m_status;
         WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
         DWORD cchTarget = _countof(szTarget);
-        CComPtr<IInternetProtocolSink> sink = self->m_sink;
-        if (sink && SUCCEEDED(UrlCombineW(self->m_url, szLocation,
-                                          szTarget, &cchTarget, 0)))
+        if (!self->m_isError && szLocation[0] &&
+            (st == 301 || st == 302 || st == 303 || st == 307) &&
+            SUCCEEDED(UrlCombineW(self->m_url, szLocation,
+                                  szTarget, &cchTarget, 0)))
         {
             sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
             sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
-            self->Release();      // matches AddRef in Start
-            return 0;
+        }
+        else
+        {
+            PROTOCOLDATA pd;
+            ZeroMemory(&pd, sizeof(pd));
+            pd.dwState  = 1;
+            pd.grfFlags = PI_FORCE_ASYNC;
+            sink->Switch(&pd);
         }
     }
 
-    // Hand control back to the apartment thread.
-    PROTOCOLDATA pd;
-    ZeroMemory(&pd, sizeof(pd));
-    pd.dwState  = 1;
-    pd.grfFlags = PI_FORCE_ASYNC;
-    if (self->m_sink)
-        self->m_sink->Switch(&pd);
-
     self->Release();      // matches AddRef in Start
     return 0;
+}
+
+STDMETHODIMP CurlProtocol::Abort(HRESULT hrReason, DWORD)
+{
+    Lock();
+    const bool bReady = m_bReady;
+    m_bAbort = true;
+    CComPtr<IInternetProtocolSink> sink = m_sink;
+    Unlock();
+    // The worker will not call Switch now, so finish the bind here.
+    if (!bReady && sink)
+        sink->ReportResult(hrReason, 0, NULL);
+    return S_OK;
+}
+
+STDMETHODIMP CurlProtocol::Terminate(DWORD)
+{
+    Lock();
+    m_bAbort = true;
+    if (m_bReady)
+    {
+        CloseAndDeleteBodyFile();
+        m_body.Free();
+    }
+    DeleteHeaderFile();
+    m_sink.Release();
+    Unlock();
+    return S_OK;
 }
 
 STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
@@ -503,6 +552,8 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     m_dispositionFilename.Empty();
     m_isAttachment = false;
     m_status       = 200;
+    m_bAbort       = false;
+    m_bReady       = false;
     CloseAndDeleteBodyFile();
     DeleteHeaderFile();
     m_bodyFileSize = 0;
@@ -601,7 +652,7 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
 
 STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
 {
-    if (!m_sink)
+    if (!m_sink || m_bAbort)
         return S_OK;
 
     // 1. Tell URLMon about the MIME type.  Error pages are always HTML;
