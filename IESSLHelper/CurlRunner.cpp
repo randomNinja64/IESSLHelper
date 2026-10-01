@@ -53,13 +53,33 @@ static void ServePipe(HANDLE hPipe, HANDLE hProcess, const void* data, DWORD cb)
             }
         }
 
-        CloseHandle(hEvent);
-
-        if (bConnected && data && cb)
+        // Write until everything is sent, curl exits, or the pipe breaks.
+        const BYTE* p = static_cast<const BYTE*>(data);
+        while (bConnected && p && cb)
         {
             DWORD cbWritten = 0;
-            WriteFile(hPipe, data, cb, &cbWritten, NULL);
+            ResetEvent(hEvent);
+            ZeroMemory(&ov, sizeof(ov));
+            ov.hEvent = hEvent;
+            BOOL bOk = WriteFile(hPipe, p, cb, &cbWritten, &ov);
+            if (!bOk && GetLastError() == ERROR_IO_PENDING)
+            {
+                HANDLE waitOn[2] = { hEvent, hProcess };
+                if (WaitForMultipleObjects(2, waitOn, FALSE, INFINITE) == WAIT_OBJECT_0)
+                    bOk = GetOverlappedResult(hPipe, &ov, &cbWritten, FALSE);
+                else
+                {
+                    CancelIo(hPipe);
+                    GetOverlappedResult(hPipe, &ov, &cbWritten, TRUE);
+                }
+            }
+            if (!bOk || cbWritten == 0)
+                break;
+            p  += cbWritten;
+            cb -= cbWritten;
         }
+
+        CloseHandle(hEvent);
     }
     CloseHandle(hPipe);
 }
