@@ -1,6 +1,7 @@
 #include "stdafx.h"
 #include "CurlRunner.h"
 #include "Util.h"
+#include <sddl.h>
 
 extern HMODULE g_hModule; // defined in dllmain.cpp
 
@@ -16,51 +17,183 @@ static bool VerbIsAlpha(LPCWSTR psz)
     return true;
 }
 
-// Block until curl opens hPipe (or exits), write data, then close the pipe
-// so the reader sees EOF.  The pipe lives only in memory.
-static void ServePipe(HANDLE hPipe, HANDLE hProcess, const void* data, DWORD cb)
+typedef BOOL (WINAPI* PFN_GetNamedPipeClientProcessId)(HANDLE, PULONG);
+
+// False when the connected client is known to be a process other than
+// dwPid.  GetNamedPipeClientProcessId is Vista+, so XP skips the check.
+static bool PipeClientIs(HANDLE hPipe, DWORD dwPid)
 {
-    HANDLE hEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (hEvent)
+    PFN_GetNamedPipeClientProcessId pfn = (PFN_GetNamedPipeClientProcessId)
+        GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "GetNamedPipeClientProcessId");
+    if (!pfn)
+        return true;
+    ULONG pid = 0;
+    return pfn(hPipe, &pid) && pid == dwPid;
+}
+
+// Security descriptor that lets only SYSTEM and this process's user open
+// an object.  Free with LocalFree.  NULL on failure.
+static PSECURITY_DESCRIPTOR CreateUserOnlySD()
+{
+    HANDLE hToken = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+        return NULL;
+    DWORD_PTR tokenUser[32]; // TOKEN_USER plus a SID of at most 68 bytes
+    DWORD cb = 0;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    if (GetTokenInformation(hToken, TokenUser, tokenUser, sizeof(tokenUser), &cb))
+    {
+        LPWSTR pszSid = NULL;
+        if (ConvertSidToStringSidW(((TOKEN_USER*)tokenUser)->User.Sid, &pszSid))
+        {
+            WCHAR szSddl[320];
+            wsprintfW(szSddl, L"D:P(A;;GA;;;SY)(A;;GA;;;%s)", pszSid);
+            if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    szSddl, SDDL_REVISION_1, &pSD, NULL))
+                pSD = NULL;
+            LocalFree(pszSid);
+        }
+    }
+    CloseHandle(hToken);
+    return pSD;
+}
+
+// Creates an outbound, single-instance pipe only the current user and
+// SYSTEM can open, under a random name written to szName.
+// INVALID_HANDLE_VALUE on failure.
+static HANDLE CreatePrivatePipe(LPCWSTR prefix, DWORD cbHint,
+                                WCHAR* szName, int cchName)
+{
+    GUID  guid;
+    WCHAR szGuid[40];
+    if (FAILED(CoCreateGuid(&guid)) || !StringFromGUID2(guid, szGuid, _countof(szGuid)))
+        return INVALID_HANDLE_VALUE;
+    if (lstrlenW(prefix) + lstrlenW(szGuid) + 24 >= cchName)
+        return INVALID_HANDLE_VALUE;
+    wsprintfW(szName, L"\\\\.\\pipe\\iesslhelper_%s_%s", prefix, szGuid);
+
+    PSECURITY_DESCRIPTOR pSD = CreateUserOnlySD();
+    if (!pSD)
+        return INVALID_HANDLE_VALUE;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), pSD, FALSE };
+
+    const DWORD dwOpen = PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED;
+    const DWORD dwMode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT;
+    HANDLE h = CreateNamedPipeW(szName, dwOpen | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                                dwMode, 1, 0, cbHint, 0, &sa);
+    // FILE_FLAG_FIRST_PIPE_INSTANCE needs XP SP2.
+    if (h == INVALID_HANDLE_VALUE && GetLastError() == ERROR_INVALID_PARAMETER)
+        h = CreateNamedPipeW(szName, dwOpen, dwMode, 1, 0, cbHint, 0, &sa);
+    LocalFree(pSD);
+    return h;
+}
+
+// Writes all of data to an overlapped pipe.  Gives up if curl exits.
+static void WritePipe(HANDLE hPipe, HANDLE hProcess, HANDLE hEvent,
+                      const BYTE* data, DWORD cb)
+{
+    while (cb)
     {
         OVERLAPPED ov;
         ZeroMemory(&ov, sizeof(ov));
         ov.hEvent = hEvent;
-
-        BOOL bConnected = ConnectNamedPipe(hPipe, &ov);
-        DWORD dwPipeErr = GetLastError();
-
-        if (!bConnected)
+        DWORD n = 0;
+        if (!WriteFile(hPipe, data, cb, NULL, &ov))
         {
-            if (dwPipeErr == ERROR_PIPE_CONNECTED)
+            if (GetLastError() != ERROR_IO_PENDING)
+                return;
+            HANDLE waitOn[2] = { hEvent, hProcess };
+            if (WaitForMultipleObjects(2, waitOn, FALSE, INFINITE) != WAIT_OBJECT_0)
             {
-                bConnected = TRUE;
-            }
-            else if (dwPipeErr == ERROR_IO_PENDING)
-            {
-                HANDLE waitOn[2] = { hEvent, hProcess };
-                DWORD dw = WaitForMultipleObjects(2, waitOn, FALSE, INFINITE);
-                if (dw == WAIT_OBJECT_0)
-                {
-                    DWORD transferred = 0;
-                    bConnected = GetOverlappedResult(hPipe, &ov, &transferred, FALSE);
-                }
-                else
-                {
-                    CancelIo(hPipe);
-                }
+                CancelIo(hPipe);
+                GetOverlappedResult(hPipe, &ov, &n, TRUE);
+                return;
             }
         }
-
-        CloseHandle(hEvent);
-
-        if (bConnected && data && cb)
-        {
-            DWORD cbWritten = 0;
-            WriteFile(hPipe, data, cb, &cbWritten, NULL);
-        }
+        if (!GetOverlappedResult(hPipe, &ov, &n, FALSE) || n == 0)
+            return;
+        data += n;
+        cb   -= n;
     }
-    CloseHandle(hPipe);
+}
+
+// One outbound pipe and the bytes curl should read from it.
+struct PipeJob
+{
+    HANDLE      hPipe;
+    const BYTE* data;
+    DWORD       cb;
+};
+
+static const int kMaxPipes = 2;
+
+// Serves every pipe in whatever order curl opens them: curl reads
+// --data-binary while parsing arguments but the cookie file only when the
+// transfer starts.  Each pipe is closed once written so curl sees EOF.
+// Returns when all are served or curl has exited.  Nothing is written
+// unless the client is curl (dwPid).  Closes every hPipe.
+static void ServePipes(PipeJob* jobs, int nJobs, HANDLE hProcess, DWORD dwPid)
+{
+    enum { kDone, kWaiting, kConnected };
+    OVERLAPPED ov[kMaxPipes];
+    HANDLE     ev[kMaxPipes];
+    int        state[kMaxPipes];
+    for (int i = 0; i < nJobs; ++i)
+    {
+        ZeroMemory(&ov[i], sizeof(ov[i]));
+        ev[i] = CreateEventW(NULL, TRUE, FALSE, NULL);
+        ov[i].hEvent = ev[i];
+        state[i] = kDone;
+        if (!ev[i])
+            continue;
+        if (ConnectNamedPipe(jobs[i].hPipe, &ov[i]) || GetLastError() == ERROR_PIPE_CONNECTED)
+            state[i] = kConnected;
+        else if (GetLastError() == ERROR_IO_PENDING)
+            state[i] = kWaiting;
+    }
+
+    for (;;)
+    {
+        for (int i = 0; i < nJobs; ++i)
+        {
+            if (state[i] != kConnected)
+                continue;
+            if (jobs[i].data && jobs[i].cb && PipeClientIs(jobs[i].hPipe, dwPid))
+                WritePipe(jobs[i].hPipe, hProcess, ev[i], jobs[i].data, jobs[i].cb);
+            CloseHandle(jobs[i].hPipe);
+            jobs[i].hPipe = INVALID_HANDLE_VALUE;
+            state[i] = kDone;
+        }
+
+        HANDLE waitOn[kMaxPipes + 1];
+        int    which[kMaxPipes];
+        int    k = 0;
+        for (int i = 0; i < nJobs; ++i)
+            if (state[i] == kWaiting) { waitOn[k] = ev[i]; which[k++] = i; }
+        if (!k)
+            break;
+        waitOn[k] = hProcess;
+        const DWORD dw = WaitForMultipleObjects(k + 1, waitOn, FALSE, INFINITE);
+        if (dw >= WAIT_OBJECT_0 + k)
+            break;   // curl exited, or the wait failed
+        const int i = which[dw - WAIT_OBJECT_0];
+        DWORD t = 0;
+        state[i] = GetOverlappedResult(jobs[i].hPipe, &ov[i], &t, FALSE) ? kConnected : kDone;
+    }
+
+    for (int i = 0; i < nJobs; ++i)
+    {
+        if (state[i] == kWaiting)
+        {
+            DWORD t = 0;
+            CancelIo(jobs[i].hPipe);
+            GetOverlappedResult(jobs[i].hPipe, &ov[i], &t, TRUE);
+        }
+        if (jobs[i].hPipe != INVALID_HANDLE_VALUE)
+            CloseHandle(jobs[i].hPipe);
+        if (ev[i])
+            CloseHandle(ev[i]);
+    }
 }
 
 // CreateProcess accepts at most 32767 characters, including the terminator.
@@ -76,25 +209,37 @@ static bool AppendArg(WCHAR* szCmd, int* pcch, LPCWSTR fmt, LPCWSTR arg)
     return true;
 }
 
-// Appends one -H argument. Quotes in the value become spaces.
+// Copies src[0..len) into the body of a quoted argument.  A quote becomes
+// quoteSub and CR/LF become spaces.  A trailing run of backslashes is
+// doubled: left alone it would escape the closing quote.  Writes at most
+// len * 2 characters.
+static WCHAR* CopyQuotedBody(WCHAR* p, LPCWSTR src, int len, WCHAR quoteSub)
+{
+    for (int i = 0; i < len; ++i)
+    {
+        WCHAR c = src[i];
+        if (c == L'"') c = quoteSub;
+        else if (c == L'\r' || c == L'\n') c = L' ';
+        *p++ = c;
+    }
+    for (int i = len; i > 0 && src[i - 1] == L'\\'; --i)
+        *p++ = L'\\';
+    return p;
+}
+
+// Appends one -H "name: value" argument.
 static bool AppendHeader(WCHAR* szCmd, int* pcch, LPCWSTR name, LPCWSTR value)
 {
-    int nlen = lstrlenW(name);
-    int vlen = value ? lstrlenW(value) : 0;
-    int need = nlen + vlen + 8; //  -H "name: value"
-    if (*pcch > kCmdMax - 1 - need)
+    const int nlen = lstrlenW(name);
+    const int vlen = value ? lstrlenW(value) : 0;
+    if (vlen > kCmdMax / 2 || *pcch > kCmdMax - 1 - (nlen + vlen * 2 + 8))
         return false;
     WCHAR* p = szCmd + *pcch;
     for (LPCWSTR s = L" -H \""; *s; ) *p++ = *s++;
     for (LPCWSTR s = name; *s; ) *p++ = *s++;
     *p++ = L':';
     *p++ = L' ';
-    for (int i = 0; i < vlen; ++i)
-    {
-        WCHAR c = value[i];
-        if (c == L'"' || c == L'\r' || c == L'\n') c = L' ';
-        *p++ = c;
-    }
+    p = CopyQuotedBody(p, value, vlen, L'\'');
     *p++ = L'"';
     *p = 0;
     *pcch = (int)(p - szCmd);
@@ -131,24 +276,29 @@ static bool AppendUrl(WCHAR* szCmd, int* pcch, LPCWSTR url)
     return true;
 }
 
-// Appends one already-formed header line as -H. A quote becomes an apostrophe.
+// Appends one already-formed header line as -H "line".
 static bool AppendHeaderLine(WCHAR* szCmd, int* pcch, LPCWSTR line, int len)
 {
-    int need = len + 6; //  -H "line"
-    if (len < 0 || *pcch > kCmdMax - 1 - need)
+    if (len < 0 || len > kCmdMax / 2 || *pcch > kCmdMax - 1 - (len * 2 + 6))
         return false;
     WCHAR* p = szCmd + *pcch;
     for (LPCWSTR s = L" -H \""; *s; ) *p++ = *s++;
-    for (int i = 0; i < len; ++i)
-    {
-        WCHAR c = line[i];
-        if (c == L'"') c = L'\'';
-        *p++ = c;
-    }
+    p = CopyQuotedBody(p, line, len, L'\'');
     *p++ = L'"';
     *p = 0;
     *pcch = (int)(p - szCmd);
     return true;
+}
+
+// True for a "name: value" line with a non-empty name free of spaces,
+// control characters and '@'.  curl reads -H @path as a file of headers.
+static bool IsHeaderLine(LPCWSTR line, int len)
+{
+    int i = 0;
+    for (; i < len && line[i] != L':'; ++i)
+        if (line[i] <= L' ' || line[i] == L'@')
+            return false;
+    return i > 0 && i < len;
 }
 
 bool StartCurl(const CurlRequest& req, CurlProcess* proc)
@@ -165,57 +315,31 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
         lstrcpyW(szCurl, L"curl.exe");
 
     // -----------------------------------------------------------------------
-    //  Named pipe for the request body (POST / PUT / etc.)
-    //  The server end (us) is OUTBOUND: we write, curl reads.
+    //  Named pipes for the cookie jar and the request body (POST / PUT /
+    //  etc.).  The server end (us) is OUTBOUND: we write, curl reads.
     // -----------------------------------------------------------------------
-    WCHAR  szPipeName[96] = L"";
-    HANDLE hPipe          = INVALID_HANDLE_VALUE;
-    WCHAR  szCookiePipe[96] = L"";
-    HANDLE hCookiePipe      = INVALID_HANDLE_VALUE;
+    WCHAR szPipeName[96]   = L"";
+    WCHAR szCookiePipe[96] = L"";
+    ScopedHandle hPipe;
+    ScopedHandle hCookiePipe;
 
-    static LONG s_seq = 0;
     const bool bHasBody = (req.pPostData != NULL && req.cbPostData > 0);
     const bool bHasCookies = (req.pCookieJar != NULL && req.cbCookieJar > 0);
 
     if (bHasCookies)
     {
-        LONG seq = InterlockedIncrement(&s_seq);
-        wsprintfW(szCookiePipe,
-            L"\\\\.\\pipe\\curlbho_ck_%08X_%08X",
-            GetCurrentProcessId(), (DWORD)seq);
-
-        hCookiePipe = CreateNamedPipeW(
-            szCookiePipe,
-            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1, 0, req.cbCookieJar + 1, 0, NULL);
-
-        if (hCookiePipe == INVALID_HANDLE_VALUE)
+        hCookiePipe.Attach(CreatePrivatePipe(L"ck", req.cbCookieJar + 1,
+                                             szCookiePipe, _countof(szCookiePipe)));
+        if (!hCookiePipe.Valid())
             return false;
     }
 
     if (bHasBody)
     {
-        LONG seq = InterlockedIncrement(&s_seq);
-        wsprintfW(szPipeName,
-            L"\\\\.\\pipe\\curlbho_%08X_%08X",
-            GetCurrentProcessId(), (DWORD)seq);
-
-        hPipe = CreateNamedPipeW(
-            szPipeName,
-            PIPE_ACCESS_OUTBOUND | FILE_FLAG_OVERLAPPED,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-            1,                  // max instances
-            0,                  // outbound buffer hint (server writes)
-            req.cbPostData + 1, // inbound buffer hint  (client reads)
-            0,                  // default timeout
-            NULL);
-
-        if (hPipe == INVALID_HANDLE_VALUE)
-        {
-            if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
+        hPipe.Attach(CreatePrivatePipe(L"body", req.cbPostData + 1,
+                                       szPipeName, _countof(szPipeName)));
+        if (!hPipe.Valid())
             return false;
-        }
     }
 
     // -----------------------------------------------------------------------
@@ -224,11 +348,7 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     // -----------------------------------------------------------------------
     WCHAR* szCmd = (WCHAR*)LocalAlloc(LMEM_FIXED, kCmdMax * sizeof(WCHAR));
     if (!szCmd)
-    {
-        if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
-        if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
         return false;
-    }
     int cch = 0;
     szCmd[0] = 0;
     // --compressed: ask for and transparently decode gzip/deflate/brotli.
@@ -242,8 +362,9 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     // long as they need.
     // -i: response headers come first on stdout, so the caller can act on
     // them before the body has finished arriving.
+    // -g: [] and {} in a URL are literal, not curl glob patterns.
     bool bCmd = AppendArg(szCmd, &cch,
-        L"\"%s\" -i --ssl-no-revoke --compressed -sS --connect-timeout 30",
+        L"\"%s\" -i -g --ssl-no-revoke --compressed -sS --connect-timeout 30",
         szCurl);
 
     // No '=' in the pipe path, so curl opens it as a cookie file. The
@@ -271,7 +392,7 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
             while (*pEnd && *pEnd != L'\r' && *pEnd != L'\n') ++pEnd;
             int len = (int)(pEnd - pLine);
             const bool bCookie = len >= 7 && _wcsnicmp(pLine, L"Cookie:", 7) == 0;
-            if (len > 0 && !bCookie)
+            if (len > 0 && !bCookie && IsHeaderLine(pLine, len))
                 bCmd = AppendHeaderLine(szCmd, &cch, pLine, len);
             pLine = pEnd;
             while (*pLine == L'\r' || *pLine == L'\n') ++pLine;
@@ -289,8 +410,6 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     if (!bCmd)
     {
         LocalFree(szCmd);
-        if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
-        if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
         return false;
     }
 
@@ -347,20 +466,27 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     hErrWrite.Close();
 
     if (!bOk)
-    {
-        if (hCookiePipe != INVALID_HANDLE_VALUE) CloseHandle(hCookiePipe);
-        if (hPipe != INVALID_HANDLE_VALUE) CloseHandle(hPipe);
         return false;
-    }
     CloseHandle(pi.hThread);
 
-    // Cookie file first: curl reads it at startup, before the request body.
-    if (bHasCookies && hCookiePipe != INVALID_HANDLE_VALUE)
-        ServePipe(hCookiePipe, pi.hProcess, req.pCookieJar, req.cbCookieJar);
-
-    // POST body. Overlapped connect also wakes if curl exits first.
-    if (bHasBody && hPipe != INVALID_HANDLE_VALUE)
-        ServePipe(hPipe, pi.hProcess, req.pPostData, req.cbPostData);
+    // Cookie jar and POST body.  The waits also end if curl exits first.
+    PipeJob jobs[kMaxPipes];
+    int nJobs = 0;
+    if (hCookiePipe.Valid())
+    {
+        jobs[nJobs].hPipe = hCookiePipe.Detach();
+        jobs[nJobs].data  = req.pCookieJar;
+        jobs[nJobs].cb    = req.cbCookieJar;
+        ++nJobs;
+    }
+    if (hPipe.Valid())
+    {
+        jobs[nJobs].hPipe = hPipe.Detach();
+        jobs[nJobs].data  = req.pPostData;
+        jobs[nJobs].cb    = req.cbPostData;
+        ++nJobs;
+    }
+    ServePipes(jobs, nJobs, pi.hProcess, pi.dwProcessId);
 
     proc->hProcess = pi.hProcess;
     proc->hOut     = hOutRead.Detach();
