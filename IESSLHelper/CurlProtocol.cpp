@@ -348,6 +348,38 @@ static void GetUserAgent(IInternetBindInfo* pBindInfo, CComBSTR& ua)
         ua = wsz;
 }
 
+// The host's IHttpNegotiate, from whichever of the sink or bind info
+// offers it as a service.
+static void GetHttpNegotiate(IUnknown* pSink, IUnknown* pBindInfo,
+                             CComPtr<IHttpNegotiate>& out)
+{
+    out.Release();
+    IUnknown* sources[2] = { pSink, pBindInfo };
+    for (int i = 0; i < 2 && !out; ++i)
+    {
+        CComQIPtr<IServiceProvider> sp(sources[i]);
+        if (!sp || FAILED(sp->QueryService(IID_IHttpNegotiate, IID_IHttpNegotiate,
+                                           (void**)&out)))
+            out.Release();
+    }
+}
+
+// b in the ANSI code page as a NUL-terminated wide string of *pcch
+// characters.  Free with LocalFree.  NULL when empty or out of memory.
+static WCHAR* AnsiToWide(const Bytes& b, int* pcch)
+{
+    *pcch = 0;
+    int cch = b.size ? MultiByteToWideChar(CP_ACP, 0, (const char*)b.data,
+                                           (int)b.size, NULL, 0) : 0;
+    WCHAR* psz = cch > 0 ? (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR)) : NULL;
+    if (!psz)
+        return NULL;
+    MultiByteToWideChar(CP_ACP, 0, (const char*)b.data, (int)b.size, psz, cch);
+    psz[cch] = 0;
+    *pcch = cch;
+    return psz;
+}
+
 static void SwitchTo(IInternetProtocolSink* sink)
 {
     PROTOCOLDATA pd;
@@ -437,6 +469,7 @@ private:
     CComBSTR                       m_contentType;   // Content-Type for POST/PUT
     CComBSTR                       m_extraHeaders;  // extra request headers
     CComBSTR                       m_userAgent;     // IE's User-Agent
+    CComPtr<IHttpNegotiate>        m_negotiate;     // apartment thread only
     Bytes                          m_postData;      // request body for POST/PUT
 
     // Response body queued for Read: unread bytes are m_buf[m_bufPos..size).
@@ -754,16 +787,8 @@ void CurlProtocol::Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrByt
     else if (m_szCache[0])
     {
         // Register the file under the real URL so IE owns and evicts it.
-        int cch = MultiByteToWideChar(CP_ACP, 0, (const char*)m_rawHeaders.data,
-                                      (int)m_rawHeaders.size, NULL, 0);
-        WCHAR* pszHeaders = cch > 0
-            ? (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR)) : NULL;
-        if (pszHeaders)
-        {
-            MultiByteToWideChar(CP_ACP, 0, (const char*)m_rawHeaders.data,
-                                (int)m_rawHeaders.size, pszHeaders, cch);
-            pszHeaders[cch] = 0;
-        }
+        int cch = 0;
+        WCHAR* pszHeaders = AnsiToWide(m_rawHeaders, &cch);
         FILETIME zero = { 0, 0 };
         CommitUrlCacheEntryW(m_url, m_szCache, zero, zero, NORMAL_CACHE_ENTRY,
                              pszHeaders, pszHeaders ? (DWORD)cch : 0, NULL, NULL);
@@ -988,6 +1013,7 @@ STDMETHODIMP CurlProtocol::Terminate(DWORD)
     m_bufPos = 0;
     m_sink.Release();
     Unlock();
+    m_negotiate.Release();
     return S_OK;
 }
 
@@ -1107,6 +1133,31 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     }
     GetUserAgent(pBindInfo, m_userAgent);
 
+    // The host adds its own request headers here: IE's Referer, XHR
+    // setRequestHeader values, and so on.
+    GetHttpNegotiate(pSink, pBindInfo, m_negotiate);
+    if (m_negotiate)
+    {
+        LPWSTR  pszAdd = NULL;
+        HRESULT hr = m_negotiate->BeginningTransaction(
+            m_url, m_extraHeaders.Length() > 0 ? (LPCWSTR)m_extraHeaders : NULL,
+            0, &pszAdd);
+        if (hr == E_ABORT)
+        {
+            if (pszAdd) CoTaskMemFree(pszAdd);
+            m_negotiate.Release();
+            return E_ABORT;
+        }
+        if (pszAdd && pszAdd[0])
+        {
+            const UINT n = m_extraHeaders.Length();
+            if (n > 0 && m_extraHeaders[n - 1] != L'\n')
+                m_extraHeaders.Append(L"\r\n");
+            m_extraHeaders.Append(pszAdd);
+        }
+        if (pszAdd) CoTaskMemFree(pszAdd);
+    }
+
     AddRef();   // hold a ref for the worker
     HANDLE hThread = CreateThread(NULL, 0, &CurlProtocol::WorkerProc,
                                   this, 0, NULL);
@@ -1223,6 +1274,20 @@ STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
     if (!m_bReported)
     {
         m_bReported = true;
+        if (m_negotiate && !m_isError)
+        {
+            int     cch = 0;
+            WCHAR*  pszResp = AnsiToWide(m_rawHeaders, &cch);
+            LPWSTR  pszReqAdd = NULL;
+            HRESULT hr = m_negotiate->OnResponse(m_status, pszResp, NULL, &pszReqAdd);
+            if (pszReqAdd) CoTaskMemFree(pszReqAdd);
+            if (pszResp) LocalFree(pszResp);
+            if (hr == E_ABORT)
+            {
+                Abort(E_ABORT, 0);
+                return S_OK;
+            }
+        }
         ReportHeaders(sink, sniffBuf, cbSniff);
         flags |= BSCF_FIRSTDATANOTIFICATION;
     }
