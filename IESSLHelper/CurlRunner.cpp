@@ -227,18 +227,15 @@ static WCHAR* CopyQuotedBody(WCHAR* p, LPCWSTR src, int len, WCHAR quoteSub)
     return p;
 }
 
-// Appends one -H "name: value" argument.
-static bool AppendHeader(WCHAR* szCmd, int* pcch, LPCWSTR name, LPCWSTR value)
+// Appends prefix (which opens the quote, e.g. L" -A \"") then value, quoted.
+static bool AppendQuoted(WCHAR* szCmd, int* pcch, LPCWSTR prefix, LPCWSTR value)
 {
-    const int nlen = lstrlenW(name);
+    const int plen = lstrlenW(prefix);
     const int vlen = value ? lstrlenW(value) : 0;
-    if (vlen > kCmdMax / 2 || *pcch > kCmdMax - 1 - (nlen + vlen * 2 + 8))
+    if (vlen > kCmdMax / 2 || *pcch > kCmdMax - 1 - (plen + vlen * 2 + 1))
         return false;
     WCHAR* p = szCmd + *pcch;
-    for (LPCWSTR s = L" -H \""; *s; ) *p++ = *s++;
-    for (LPCWSTR s = name; *s; ) *p++ = *s++;
-    *p++ = L':';
-    *p++ = L' ';
+    for (LPCWSTR s = prefix; *s; ) *p++ = *s++;
     p = CopyQuotedBody(p, value, vlen, L'\'');
     *p++ = L'"';
     *p = 0;
@@ -379,7 +376,17 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
         bCmd = AppendArg(szCmd, &cch, L" -X %s", req.pszVerb);
 
     if (bCmd && req.pszContentType && req.pszContentType[0])
-        bCmd = AppendHeader(szCmd, &cch, L"Content-Type", req.pszContentType);
+        bCmd = AppendQuoted(szCmd, &cch, L" -H \"Content-Type: ", req.pszContentType);
+
+    // A User-Agent line in the extra headers wins over -A; sending both
+    // would put two User-Agent headers on the request.
+    bool bHasUaHeader = false;
+    for (LPCWSTR s = req.pszExtraHeaders; s && *s; ++s)
+        if ((s == req.pszExtraHeaders || s[-1] == L'\n') &&
+            _wcsnicmp(s, L"User-Agent:", 11) == 0)
+            bHasUaHeader = true;
+    if (bCmd && !bHasUaHeader && req.pszUserAgent && req.pszUserAgent[0])
+        bCmd = AppendQuoted(szCmd, &cch, L" -A \"", req.pszUserAgent);
 
     // Extra request headers (CRLF-delimited string from URLMon).
     // Cookie is supplied from WinInet on the cookie pipe.

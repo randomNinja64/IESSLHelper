@@ -312,6 +312,42 @@ static bool RendersInline(LPCWSTR mime)
     return false;
 }
 
+// IE's User-Agent: the bind's own string, else this session's (which
+// UrlMkSetSessionOption may have changed), else the registry default.
+static void GetUserAgent(IInternetBindInfo* pBindInfo, CComBSTR& ua)
+{
+    ua.Empty();
+    if (pBindInfo)
+    {
+        LPOLESTR psz = NULL;
+        ULONG    cFetched = 0;
+        if (SUCCEEDED(pBindInfo->GetBindString(BINDSTRING_USER_AGENT, &psz, 1, &cFetched))
+            && cFetched > 0 && psz && psz[0])
+            ua = psz;
+        if (psz) CoTaskMemFree(psz);
+        if (ua.Length() > 0)
+            return;
+    }
+
+    // UrlMkGetSessionOption returns E_OUTOFMEMORY even when it fills the
+    // buffer; cb (length including the terminator) is what says it fit.
+    char  sz[1024];
+    DWORD cb = 0;
+    sz[0] = 0;
+    UrlMkGetSessionOption(URLMON_OPTION_USERAGENT, sz, sizeof(sz), &cb, 0);
+    if (cb == 0 || cb > sizeof(sz) || !sz[0])
+    {
+        sz[0] = 0;
+        cb = sizeof(sz);
+        if (FAILED(ObtainUserAgentString(0, sz, &cb)))
+            return;
+    }
+    sz[sizeof(sz) - 1] = 0;
+    WCHAR wsz[1024];
+    if (MultiByteToWideChar(CP_ACP, 0, sz, -1, wsz, _countof(wsz)) > 1)
+        ua = wsz;
+}
+
 static void SwitchTo(IInternetProtocolSink* sink)
 {
     PROTOCOLDATA pd;
@@ -400,6 +436,7 @@ private:
     CComBSTR                       m_verb;          // "POST"/"PUT"/etc. (empty = GET)
     CComBSTR                       m_contentType;   // Content-Type for POST/PUT
     CComBSTR                       m_extraHeaders;  // extra request headers
+    CComBSTR                       m_userAgent;     // IE's User-Agent
     Bytes                          m_postData;      // request body for POST/PUT
 
     // Response body queued for Read: unread bytes are m_buf[m_bufPos..size).
@@ -791,6 +828,8 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         req.cbCookieJar     = cookieJar.size;
         req.pszExtraHeaders = self->m_extraHeaders.Length() > 0
                               ? (LPCWSTR)self->m_extraHeaders : NULL;
+        req.pszUserAgent    = self->m_userAgent.Length() > 0
+                              ? (LPCWSTR)self->m_userAgent : NULL;
         if (!asGet)
         {
             req.pszVerb        = self->m_verb.Length()        > 0 ? (LPCWSTR)self->m_verb        : NULL;
@@ -968,6 +1007,7 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     m_verb.Empty();
     m_contentType.Empty();
     m_extraHeaders.Empty();
+    m_userAgent.Empty();
     m_rawHeaders.Free();
     m_serverContentType.Empty();
     m_dispositionFilename.Empty();
@@ -1065,6 +1105,7 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
             }
         }
     }
+    GetUserAgent(pBindInfo, m_userAgent);
 
     AddRef();   // hold a ref for the worker
     HANDLE hThread = CreateThread(NULL, 0, &CurlProtocol::WorkerProc,

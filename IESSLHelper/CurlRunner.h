@@ -23,6 +23,7 @@ struct CurlRequest
     DWORD       cbCookieJar;
     LPCWSTR     pszVerb;          // NULL / empty -> GET
     LPCWSTR     pszContentType;   // NULL -> not forwarded
+    LPCWSTR     pszUserAgent;     // NULL -> curl's default
     LPCWSTR     pszExtraHeaders;  // NULL or \r\n-delimited extra headers
     const BYTE* pPostData;        // NULL -> no request body
     DWORD       cbPostData;
