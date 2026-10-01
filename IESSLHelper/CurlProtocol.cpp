@@ -291,6 +291,27 @@ static void ParseDisposition(const char* v, DWORD vlen,
     }
 }
 
+// True for MIME types IE displays in the window.  Anything else (or no
+// Content-Type at all) may end up in the download dialog, which takes over
+// the navigation's bind and needs a cache file it never asked for.
+static bool RendersInline(LPCWSTR mime)
+{
+    if (!mime || !*mime)
+        return false;
+    if (_wcsnicmp(mime, L"text/", 5) == 0 || _wcsnicmp(mime, L"image/", 6) == 0)
+        return true;
+    static const LPCWSTR kInline[] = {
+        L"application/javascript", L"application/x-javascript",
+        L"application/ecmascript", L"application/json",
+        L"application/xml",        L"application/xhtml+xml",
+        L"application/rss+xml",    L"application/atom+xml",
+    };
+    for (int i = 0; i < _countof(kInline); ++i)
+        if (_wcsicmp(mime, kInline[i]) == 0)
+            return true;
+    return false;
+}
+
 static void SwitchTo(IInternetProtocolSink* sink)
 {
     PROTOCOLDATA pd;
@@ -857,7 +878,8 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             else
             {
                 haveHeaders = true;
-                if (self->m_needFile || self->m_isAttachment)
+                if (self->m_needFile || self->m_isAttachment ||
+                    (st >= 200 && st < 300 && !RendersInline(self->m_serverContentType)))
                     self->BeginCache();
                 if (body < head.size)
                     stop = !self->Deliver(head.data + body, head.size - body);
