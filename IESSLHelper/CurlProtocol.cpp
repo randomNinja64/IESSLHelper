@@ -478,17 +478,27 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
         else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
         {
             DWORD vlen = (DWORD)(lineEnd - v);
-            // Strip any "; charset=..." parameters for the MIME.
-            DWORD mlen = 0;
-            while (mlen < vlen && v[mlen] != ';' &&
-                   v[mlen] != ' ' && v[mlen] != '\t') ++mlen;
-            if (mlen > 0)
+            while (vlen > 0 && (v[0] == ' ' || v[0] == '\t')) { ++v; --vlen; }
+            while (vlen > 0 && (v[vlen - 1] == ' ' || v[vlen - 1] == '\t'))
+                --vlen;
+            // Keep "; charset=...". IE reads the charset from this string.
+            // A value that does not fit falls back to the bare type.
+            WCHAR wbuf[256];
+            int wlen = vlen > 0
+                ? MultiByteToWideChar(CP_UTF8, 0, v, (int)vlen,
+                                      wbuf, _countof(wbuf) - 1)
+                : 0;
+            if (wlen <= 0 && vlen > 0)
             {
-                WCHAR wbuf[256];
-                int wlen = MultiByteToWideChar(CP_UTF8, 0, v, mlen,
-                                              wbuf, _countof(wbuf) - 1);
-                if (wlen > 0) { wbuf[wlen] = 0; m_serverContentType = wbuf; }
+                DWORD mlen = 0;
+                while (mlen < vlen && v[mlen] != ';' &&
+                       v[mlen] != ' ' && v[mlen] != '\t') ++mlen;
+                wlen = mlen > 0
+                    ? MultiByteToWideChar(CP_UTF8, 0, v, (int)mlen,
+                                          wbuf, _countof(wbuf) - 1)
+                    : 0;
             }
+            if (wlen > 0) { wbuf[wlen] = 0; m_serverContentType = wbuf; }
         }
         else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Length", 14))
         {
@@ -736,6 +746,49 @@ static DWORD WINAPI StderrReadProc(LPVOID p)
     return 0;
 }
 
+static WCHAR* JoinUserPass(LPCWSTR user, LPCWSTR pass)
+{
+    int nu = lstrlenW(user);
+    int np = pass ? lstrlenW(pass) : 0;
+    WCHAR* s = (WCHAR*)LocalAlloc(LMEM_FIXED, (nu + np + 2) * sizeof(WCHAR));
+    if (!s)
+        return NULL;
+    int n = 0;
+    for (int i = 0; i < nu; ++i)
+        if (user[i] != L'\r' && user[i] != L'\n')
+            s[n++] = user[i];
+    s[n++] = L':';
+    for (int i = 0; i < np; ++i)
+        if (pass[i] != L'\r' && pass[i] != L'\n')
+            s[n++] = pass[i];
+    s[n] = 0;
+    return s;
+}
+
+// IE's own login dialog. The password stays off the curl command line;
+// the caller puts "name:password" on a named pipe.
+static bool PromptAuth(IInternetProtocolSink* sink, WCHAR** outCred)
+{
+    *outCred = NULL;
+    if (!sink)
+        return false;
+    CComPtr<IServiceProvider> sp;
+    if (FAILED(sink->QueryInterface(IID_IServiceProvider, (void**)&sp)) || !sp)
+        return false;
+    CComPtr<IAuthenticate> auth;
+    if (FAILED(sp->QueryService(IID_IAuthenticate, IID_IAuthenticate, (void**)&auth)) || !auth)
+        return false;
+    HWND hwnd = NULL;
+    LPWSTR user = NULL;
+    LPWSTR pass = NULL;
+    HRESULT hr = auth->Authenticate(&hwnd, &user, &pass);
+    if (SUCCEEDED(hr) && user && user[0])
+        *outCred = JoinUserPass(user, pass);
+    if (user) CoTaskMemFree(user);
+    if (pass) CoTaskMemFree(pass);
+    return *outCred != NULL;
+}
+
 DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
 {
     CurlProtocol* self = static_cast<CurlProtocol*>(p);
@@ -746,8 +799,13 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     bool haveHeaders = false;
     bool redirected  = false;
     bool asGet       = false;
+    bool askedAuth   = false;
     DWORD dwExit     = curlbho::FETCH_LAUNCH_FAILED;
     Bytes stderrBytes;
+    WCHAR* authUser  = NULL;
+    WCHAR* authProxy = NULL;
+    WCHAR authHost[INTERNET_MAX_HOST_NAME_LENGTH + 1];
+    authHost[0] = 0;
 
     // One pass per redirect hop.  A document navigation reports the redirect
     // to URLMon.  A download bind (BINDF_NEEDFILE) does not follow that
@@ -763,6 +821,12 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         Bytes cookieJar;
         BuildCookieJar(hop, cookieJar);
 
+        WCHAR hopHost[INTERNET_MAX_HOST_NAME_LENGTH + 1];
+        hopHost[0] = 0;
+        DWORD cchHost = _countof(hopHost);
+        if (FAILED(UrlGetPartW(hop, hopHost, &cchHost, URL_PART_HOSTNAME, 0)))
+            hopHost[0] = 0;
+
         CurlRequest req;
         ZeroMemory(&req, sizeof(req));
         req.pszURL          = hop;
@@ -777,6 +841,10 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             req.pPostData      = self->m_postData.data;
             req.cbPostData     = self->m_postData.size;
         }
+        if (authUser && hopHost[0] && _wcsicmp(hopHost, authHost) == 0)
+            req.pszUser = authUser;
+        if (authProxy)
+            req.pszProxyUser = authProxy;
 
         CurlProcess proc;
         if (!curlbho::StartCurl(req, &proc))
@@ -802,6 +870,7 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         Bytes head;
         bool  stop   = false;
         bool  follow = false;
+        DWORD authStatus = 0;
         BYTE  buf[65536];
         DWORD cbRead = 0;
         while (!stop && ReadFile(proc.hOut, buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
@@ -854,6 +923,13 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
                     redirected = stop = true;
                 }
             }
+            else if ((st == 401 || st == 407) && !askedAuth)
+            {
+                // One retry. Cancel still fetches the challenge page.
+                askedAuth = true;
+                authStatus = st;
+                stop = true;
+            }
             else
             {
                 haveHeaders = true;
@@ -878,8 +954,33 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             CloseHandle(hErrThread);
         }
 
-        if (follow)
+        if (follow || authStatus)
         {
+            if (authStatus)
+            {
+                self->Lock();
+                const bool aborted = self->m_bAbort;
+                CComPtr<IInternetProtocolSink> sink = self->m_sink;
+                self->Unlock();
+                WCHAR* cred = NULL;
+                if (!aborted && PromptAuth(sink, &cred))
+                {
+                    if (authStatus == 407)
+                    {
+                        if (authProxy) LocalFree(authProxy);
+                        authProxy = cred;
+                    }
+                    else
+                    {
+                        if (authUser) LocalFree(authUser);
+                        authUser = cred;
+                        lstrcpynW(authHost, hopHost, _countof(authHost));
+                    }
+                }
+                else if (cred)
+                    LocalFree(cred);
+                --nHop; // the retry is not one of the five redirect hops
+            }
             stderrBytes.Free();
             curlbho::FinishCurl(&proc);
             self->ClearHopHeaders();
@@ -889,6 +990,9 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         dwExit = curlbho::FinishCurl(&proc);
         break;
     }
+
+    if (authUser) LocalFree(authUser);
+    if (authProxy) LocalFree(authProxy);
 
     if (!redirected)
         self->Finish(dwExit, haveHeaders, stderrBytes);
