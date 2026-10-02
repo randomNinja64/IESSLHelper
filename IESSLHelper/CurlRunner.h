@@ -1,6 +1,5 @@
 #pragma once
 #include "stdafx.h"
-#include "Util.h"
 
 // ---------------------------------------------------------------------------
 // CurlRunner - launches curl.exe to perform a single HTTP(S) request.

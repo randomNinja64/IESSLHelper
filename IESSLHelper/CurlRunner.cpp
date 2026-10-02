@@ -210,15 +210,15 @@ static bool AppendArg(WCHAR* szCmd, int* pcch, LPCWSTR fmt, LPCWSTR arg)
 }
 
 // Copies src[0..len) into the body of a quoted argument.  A quote becomes
-// quoteSub and CR/LF become spaces.  A trailing run of backslashes is
+// an apostrophe and CR/LF become spaces.  A trailing run of backslashes is
 // doubled: left alone it would escape the closing quote.  Writes at most
 // len * 2 characters.
-static WCHAR* CopyQuotedBody(WCHAR* p, LPCWSTR src, int len, WCHAR quoteSub)
+static WCHAR* CopyQuotedBody(WCHAR* p, LPCWSTR src, int len)
 {
     for (int i = 0; i < len; ++i)
     {
         WCHAR c = src[i];
-        if (c == L'"') c = quoteSub;
+        if (c == L'"') c = L'\'';
         else if (c == L'\r' || c == L'\n') c = L' ';
         *p++ = c;
     }
@@ -236,7 +236,7 @@ static bool AppendQuoted(WCHAR* szCmd, int* pcch, LPCWSTR prefix, LPCWSTR value)
         return false;
     WCHAR* p = szCmd + *pcch;
     for (LPCWSTR s = prefix; *s; ) *p++ = *s++;
-    p = CopyQuotedBody(p, value, vlen, L'\'');
+    p = CopyQuotedBody(p, value, vlen);
     *p++ = L'"';
     *p = 0;
     *pcch = (int)(p - szCmd);
@@ -280,7 +280,7 @@ static bool AppendHeaderLine(WCHAR* szCmd, int* pcch, LPCWSTR line, int len)
         return false;
     WCHAR* p = szCmd + *pcch;
     for (LPCWSTR s = L" -H \""; *s; ) *p++ = *s++;
-    p = CopyQuotedBody(p, line, len, L'\'');
+    p = CopyQuotedBody(p, line, len);
     *p++ = L'"';
     *p = 0;
     *pcch = (int)(p - szCmd);

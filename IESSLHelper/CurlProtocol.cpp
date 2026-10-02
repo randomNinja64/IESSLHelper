@@ -24,7 +24,7 @@
 //                v
 //        Worker thread
 //                +--- curl -i: parse the response headers from stdout
-//                +--- append body chunks to m_buf (at most kMaxQueued)
+//                +--- append body chunks to m_buf (kMaxQueued backpressure threshold)
 //                +--- pSink->Switch(&pd)   ; ask URLMon to call us back
 //                                           ; on the apartment thread
 //                v
@@ -1522,8 +1522,8 @@ STDMETHODIMP CurlProtocol::QueryInfo(DWORD dwOption, LPVOID pBuffer, DWORD* pcbB
 }
 
 // ---------------------------------------------------------------------------
-//  Class factory - a single, statically-allocated instance with a fixed
-//  refcount of 2 (so AddRef/Release are no-ops).  RegisterNameSpace keeps
+//  Class factory - a single, statically-allocated instance. AddRef/Release
+//  return fixed values of 2/1 without tracking references. RegisterNameSpace keeps
 //  a reference but we keep the object alive for the lifetime of the DLL
 //  anyway, which is correct for an in-process protocol.
 // ---------------------------------------------------------------------------

@@ -1,8 +1,6 @@
 ﻿#pragma once
 #include "stdafx.h"
 
-extern HMODULE g_hModule;
-
 // ---------------------------------------------------------------------------
 // CLSID for the IESSLHelper COM object
 // {6AF3E10B-5FD4-4A6B-B182-C47D8F743F5C}
