@@ -2,7 +2,7 @@
 #include "BHO.h"
 
 // ---------------------------------------------------------------------------
-// DLL instance handle – used by BHO.cpp to locate curl.exe alongside the DLL
+// DLL instance handle – used by CurlRunner.cpp to locate curl.exe alongside the DLL
 // ---------------------------------------------------------------------------
 HMODULE g_hModule = NULL;
 
@@ -80,13 +80,16 @@ static HRESULT RegWriteDword(HKEY hRoot, LPCWSTR pszKey,
     return HRESULT_FROM_WIN32(lRet);
 }
 
-// CLSID string – must match CLSID_IESSLHelper defined in BHO.h
-static const WCHAR g_szClsid[] = L"{6AF3E10B-5FD4-4A6B-B182-C47D8F743F5C}";
+// "{6AF3E10B-...}" for CLSID_IESSLHelper.
+static void GetClsidString(WCHAR (&sz)[40])
+{
+    StringFromGUID2(CLSID_IESSLHelper, sz, _countof(sz));
+}
 
 // ===========================================================================
 // DllRegisterServer
 //
-// Writes three registry entries:
+// Writes five registry entries:
 //   HKCR\CLSID\{...}                                              = "IESSLHelper"
 //   HKCR\CLSID\{...}\InprocServer32                              = <dll path>
 //   HKCR\CLSID\{...}\InprocServer32\ThreadingModel               = "Apartment"
@@ -98,16 +101,19 @@ STDAPI DllRegisterServer()
     WCHAR szDllPath[MAX_PATH];
     GetModuleFileNameW(g_hModule, szDllPath, MAX_PATH);
 
+    WCHAR szClsid[40];
+    GetClsidString(szClsid);
+
     WCHAR szKey[256];
     HRESULT hr;
 
     // HKCR\CLSID\{...}
-    wsprintfW(szKey, L"CLSID\\%s", g_szClsid);
+    wsprintfW(szKey, L"CLSID\\%s", szClsid);
     hr = RegWriteSz(HKEY_CLASSES_ROOT, szKey, NULL, L"IESSLHelper");
     if (FAILED(hr)) return hr;
 
     // HKCR\CLSID\{...}\InprocServer32
-    wsprintfW(szKey, L"CLSID\\%s\\InprocServer32", g_szClsid);
+    wsprintfW(szKey, L"CLSID\\%s\\InprocServer32", szClsid);
     hr = RegWriteSz(HKEY_CLASSES_ROOT, szKey, NULL, szDllPath);
     if (FAILED(hr)) return hr;
 
@@ -118,7 +124,7 @@ STDAPI DllRegisterServer()
     wsprintfW(szKey,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
         L"Explorer\\Browser Helper Objects\\%s",
-        g_szClsid);
+        szClsid);
     hr = RegWriteSz(HKEY_LOCAL_MACHINE, szKey, NULL, L"IESSLHelper");
     if (FAILED(hr)) return hr;
 
@@ -132,15 +138,18 @@ STDAPI DllRegisterServer()
 // ===========================================================================
 STDAPI DllUnregisterServer()
 {
+    WCHAR szClsid[40];
+    GetClsidString(szClsid);
+
     WCHAR szKey[256];
 
-    wsprintfW(szKey, L"CLSID\\%s", g_szClsid);
+    wsprintfW(szKey, L"CLSID\\%s", szClsid);
     SHDeleteKeyW(HKEY_CLASSES_ROOT, szKey);
 
     wsprintfW(szKey,
         L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\"
         L"Explorer\\Browser Helper Objects\\%s",
-        g_szClsid);
+        szClsid);
     SHDeleteKeyW(HKEY_LOCAL_MACHINE, szKey);
 
     return S_OK;

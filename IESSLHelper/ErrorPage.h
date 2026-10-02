@@ -9,8 +9,8 @@
 
 namespace curlbho {
 
-// dwExit is either curl's process exit code or one of the FETCH_* sentinels
-// from CurlRunner.h.  stderrBytes is curl's captured stderr output (may be
+// dwExit is either curl's process exit code or FETCH_LAUNCH_FAILED from
+// CurlRunner.h.  stderrBytes is curl's captured stderr output (may be
 // empty).  Result is written to out.
 void BuildErrorPage(Bytes& out, LPCWSTR pszURL, DWORD dwExit,
                     const Bytes& stderrBytes);

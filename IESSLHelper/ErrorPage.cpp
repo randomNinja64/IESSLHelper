@@ -4,55 +4,12 @@
 
 namespace curlbho {
 
-static void AppendUtf8(Bytes& out, LPCWSTR src)
+// src (cch characters, or -1 when NUL-terminated) as HTML-escaped UTF-8.
+static void AppendEscaped(Bytes& out, LPCWSTR src, int cch)
 {
-    if (!src || !*src) return;
-    int n = WideCharToMultiByte(CP_UTF8, 0, src, -1, NULL, 0, NULL, NULL);
-    if (n <= 1) return;
-    n -= 1;   // drop terminator
-    char* tmp = (char*)LocalAlloc(LMEM_FIXED, n);
-    if (!tmp) return;
-    WideCharToMultiByte(CP_UTF8, 0, src, -1, tmp, n, NULL, NULL);
-    out.Append(tmp, (DWORD)n);
-    LocalFree(tmp);
-}
-
-static void AppendUtf8Escaped(Bytes& out, LPCWSTR src)
-{
-    if (!src) return;
-    while (*src)
-    {
-        WCHAR c = *src++;
-        switch (c)
-        {
-            case L'&':  out.AppendStr("&amp;");  break;
-            case L'<':  out.AppendStr("&lt;");   break;
-            case L'>':  out.AppendStr("&gt;");   break;
-            case L'"':  out.AppendStr("&quot;"); break;
-            case L'\'': out.AppendStr("&#39;");  break;
-            default:
-            {
-                WCHAR pair[2] = { c, 0 };
-                AppendUtf8(out, pair);
-                break;
-            }
-        }
-    }
-}
-
-static void AppendStderrEscaped(Bytes& out, const Bytes& src)
-{
-    for (DWORD i = 0; i < src.size; ++i)
-    {
-        char c = (char)src.data[i];
-        switch (c)
-        {
-            case '<': out.AppendStr("&lt;");  break;
-            case '>': out.AppendStr("&gt;");  break;
-            case '&': out.AppendStr("&amp;"); break;
-            default:  out.Append(&c, 1);      break;
-        }
-    }
+    Bytes utf8;
+    if (AppendMultiByte(utf8, CP_UTF8, src, cch))
+        AppendHtmlEscaped(out, (const char*)utf8.data, utf8.size);
 }
 
 void BuildErrorPage(Bytes& out, LPCWSTR pszURL, DWORD dwExit,
@@ -90,15 +47,20 @@ void BuildErrorPage(Bytes& out, LPCWSTR pszURL, DWORD dwExit,
         ".muted{color:#666;font-size:.9em}"
         "</style></head><body>"
         "<h1>Could not load page</h1><p>");
-    AppendUtf8Escaped(out, pszMsg);
+    AppendEscaped(out, pszMsg, -1);
     out.AppendStr("</p><p class=\"muted\">URL: <code>");
-    AppendUtf8Escaped(out, pszURL);
+    AppendEscaped(out, pszURL, -1);
     out.AppendStr("</code></p>");
     if (stderrBytes.size)
     {
+        // curl writes stderr in the ANSI code page; the page is UTF-8.
+        int cch = 0;
+        WCHAR* pszErr = MultiByteToWideAlloc(CP_ACP, (const char*)stderrBytes.data,
+                                             (int)stderrBytes.size, &cch);
         out.AppendStr("<h2>curl stderr</h2><pre>");
-        AppendStderrEscaped(out, stderrBytes);
+        AppendEscaped(out, pszErr, cch);
         out.AppendStr("</pre>");
+        if (pszErr) LocalFree(pszErr);
     }
     out.AppendStr("<p class=\"muted\">Served by IESSLHelper.</p></body></html>");
 }

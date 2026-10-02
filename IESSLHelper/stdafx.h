@@ -2,6 +2,7 @@
 
 #define WINVER       0x0501
 #define _WIN32_WINNT 0x0501
+#define _WIN32_IE    0x0600
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -11,6 +12,5 @@
 #include <atlbase.h>    // CComPtr, CComCoClass, CAtlDllModuleT ...
 #include <atlcom.h>     // IObjectWithSiteImpl ...
 #include <urlmon.h>     // IInternetProtocol, IInternetSession, FindMimeFromData
-#include <shlobj.h>     // SHGetFolderPathW, CSIDL_DESKTOPDIRECTORY
 #include <shlwapi.h>    // PathRemoveFileSpecW, PathAppendW,
                         // PathFileExistsW, SHDeleteKeyW

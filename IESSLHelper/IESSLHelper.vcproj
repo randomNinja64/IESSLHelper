@@ -43,7 +43,7 @@
 			<Tool
 				Name="VCCLCompilerTool"
 				Optimization="0"
-				PreprocessorDefinitions="WIN32;_DEBUG;_WINDOWS;_USRDLL;WINVER=0x0501;_WIN32_WINNT=0x0501;_WIN32_IE=0x0600"
+				PreprocessorDefinitions="WIN32;_DEBUG;_WINDOWS;_USRDLL"
 				MinimalRebuild="true"
 				BasicRuntimeChecks="3"
 				RuntimeLibrary="1"
@@ -63,7 +63,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="kernel32.lib user32.lib ole32.lib oleaut32.lib shlwapi.lib shell32.lib advapi32.lib urlmon.lib wininet.lib"
+				AdditionalDependencies="kernel32.lib user32.lib ole32.lib oleaut32.lib shlwapi.lib advapi32.lib urlmon.lib wininet.lib"
 				LinkIncremental="2"
 				ModuleDefinitionFile="IESSLHelper.def"
 				GenerateDebugInformation="true"
@@ -123,7 +123,7 @@
 				Name="VCCLCompilerTool"
 				Optimization="2"
 				EnableIntrinsicFunctions="true"
-				PreprocessorDefinitions="WIN32;NDEBUG;_WINDOWS;_USRDLL;WINVER=0x0501;_WIN32_WINNT=0x0501;_WIN32_IE=0x0600"
+				PreprocessorDefinitions="WIN32;NDEBUG;_WINDOWS;_USRDLL"
 				StringPooling="true"
 				RuntimeLibrary="0"
 				EnableFunctionLevelLinking="true"
@@ -143,7 +143,7 @@
 			/>
 			<Tool
 				Name="VCLinkerTool"
-				AdditionalDependencies="kernel32.lib user32.lib ole32.lib oleaut32.lib shlwapi.lib shell32.lib advapi32.lib urlmon.lib wininet.lib"
+				AdditionalDependencies="kernel32.lib user32.lib ole32.lib oleaut32.lib shlwapi.lib advapi32.lib urlmon.lib wininet.lib"
 				LinkIncremental="1"
 				ModuleDefinitionFile="IESSLHelper.def"
 				GenerateDebugInformation="false"
@@ -224,10 +224,6 @@
 						UsePrecompiledHeader="1"
 					/>
 				</FileConfiguration>
-			</File>
-			<File
-				RelativePath=".\Util.cpp"
-				>
 			</File>
 		</Filter>
 		<Filter

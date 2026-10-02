@@ -38,6 +38,8 @@
 using curlbho::Bytes;
 using curlbho::CurlProcess;
 using curlbho::CurlRequest;
+using curlbho::MultiByteToWideAlloc;
+using curlbho::ParseDecimal;
 using curlbho::ScopedHandle;
 
 namespace {
@@ -49,6 +51,8 @@ static const DWORD kMaxQueued = 4 * 1024 * 1024;
 static const DWORD kCompactAt = 1024 * 1024;
 // Responses whose headers exceed this are treated as failures.
 static const DWORD kMaxHeaderBytes = 1024 * 1024;
+// Curl runs at most this many times per request (the rest are redirects).
+static const int kMaxHops = 5;
 
 // Helper used when parsing response headers — replaces a C++11 lambda so the
 // file compiles with VC9 (VS2008).
@@ -73,9 +77,6 @@ static void BuildCookieJar(LPCWSTR pszURL, Bytes& out)
     WCHAR szHost[INTERNET_MAX_HOST_NAME_LENGTH + 1];
     DWORD cchHost = _countof(szHost);
     if (FAILED(UrlGetPartW(pszURL, szHost, &cchHost, URL_PART_HOSTNAME, 0)) || !szHost[0])
-        return;
-    char szHostA[INTERNET_MAX_HOST_NAME_LENGTH * 3 + 1];
-    if (!WideCharToMultiByte(CP_ACP, 0, szHost, -1, szHostA, sizeof(szHostA), NULL, NULL))
         return;
 
     DWORD cch = 0;
@@ -106,19 +107,12 @@ static void BuildCookieJar(LPCWSTR pszURL, Bytes& out)
             LPCWSTR pszValue = L"";
             if (pEq) { *pEq = 0; pszValue = pEq + 1; }
 
-            int cchName  = WideCharToMultiByte(CP_ACP, 0, p, -1, NULL, 0, NULL, NULL);
-            int cchValue = WideCharToMultiByte(CP_ACP, 0, pszValue, -1, NULL, 0, NULL, NULL);
-            char* pszLine = (char*)LocalAlloc(LMEM_FIXED, lstrlenA(szHostA) + cchName + cchValue + 32);
-            if (pszLine)
-            {
-                int n = wsprintfA(pszLine, "%s\tFALSE\t/\tFALSE\t0\t", szHostA);
-                n += WideCharToMultiByte(CP_ACP, 0, p, -1, pszLine + n, cchName, NULL, NULL) - 1;
-                pszLine[n++] = '\t';
-                n += WideCharToMultiByte(CP_ACP, 0, pszValue, -1, pszLine + n, cchValue, NULL, NULL) - 1;
-                pszLine[n++] = '\n';
-                out.Append(pszLine, (DWORD)n);
-                LocalFree(pszLine);
-            }
+            AppendMultiByte(out, CP_ACP, szHost, -1);
+            out.AppendStr("\tFALSE\t/\tFALSE\t0\t");
+            AppendMultiByte(out, CP_ACP, p, -1);
+            out.AppendStr("\t");
+            AppendMultiByte(out, CP_ACP, pszValue, -1);
+            out.AppendStr("\n");
         }
         p = pNext;
     }
@@ -128,13 +122,9 @@ static void BuildCookieJar(LPCWSTR pszURL, Bytes& out)
 // Stores one Set-Cookie header value in WinInet for pszURL.
 static void StoreSetCookie(LPCWSTR pszURL, const char* v, DWORD vlen)
 {
-    if (!vlen) return;
-    int cch = MultiByteToWideChar(CP_ACP, 0, v, (int)vlen, NULL, 0);
-    if (cch <= 0) return;
-    WCHAR* psz = (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR));
+    int cch = 0;
+    WCHAR* psz = MultiByteToWideAlloc(CP_ACP, v, (int)vlen, &cch);
     if (!psz) return;
-    MultiByteToWideChar(CP_ACP, 0, v, (int)vlen, psz, cch);
-    psz[cch] = 0;
     InternetSetCookieW(pszURL, NULL, psz);
     LocalFree(psz);
 }
@@ -364,22 +354,6 @@ static void GetHttpNegotiate(IUnknown* pSink, IUnknown* pBindInfo,
     }
 }
 
-// b in the ANSI code page as a NUL-terminated wide string of *pcch
-// characters.  Free with LocalFree.  NULL when empty or out of memory.
-static WCHAR* AnsiToWide(const Bytes& b, int* pcch)
-{
-    *pcch = 0;
-    int cch = b.size ? MultiByteToWideChar(CP_ACP, 0, (const char*)b.data,
-                                           (int)b.size, NULL, 0) : 0;
-    WCHAR* psz = cch > 0 ? (WCHAR*)LocalAlloc(LMEM_FIXED, (cch + 1) * sizeof(WCHAR)) : NULL;
-    if (!psz)
-        return NULL;
-    MultiByteToWideChar(CP_ACP, 0, (const char*)b.data, (int)b.size, psz, cch);
-    psz[cch] = 0;
-    *pcch = cch;
-    return psz;
-}
-
 static void SwitchTo(IInternetProtocolSink* sink)
 {
     PROTOCOLDATA pd;
@@ -395,14 +369,12 @@ static void SwitchTo(IInternetProtocolSink* sink)
 class ATL_NO_VTABLE CurlProtocol :
     public CComObjectRootEx<CComMultiThreadModel>,
     public IInternetProtocol,
-    public IInternetProtocolInfo,
     public IWinInetHttpInfo
 {
 public:
     BEGIN_COM_MAP(CurlProtocol)
         COM_INTERFACE_ENTRY(IInternetProtocol)
         COM_INTERFACE_ENTRY(IInternetProtocolRoot)
-        COM_INTERFACE_ENTRY(IInternetProtocolInfo)
         COM_INTERFACE_ENTRY(IWinInetHttpInfo)
         COM_INTERFACE_ENTRY(IWinInetInfo)
     END_COM_MAP()
@@ -434,15 +406,6 @@ public:
     STDMETHOD(LockRequest)(DWORD)           { return S_OK; }
     STDMETHOD(UnlockRequest)()              { return S_OK; }
 
-    // IInternetProtocolInfo - default-action everything ---------------------
-    STDMETHOD(ParseUrl)(LPCWSTR, PARSEACTION, DWORD, LPWSTR, DWORD,
-                        DWORD*, DWORD)                       { return INET_E_DEFAULT_ACTION; }
-    STDMETHOD(CombineUrl)(LPCWSTR, LPCWSTR, DWORD, LPWSTR, DWORD,
-                          DWORD*, DWORD)                     { return INET_E_DEFAULT_ACTION; }
-    STDMETHOD(CompareUrl)(LPCWSTR, LPCWSTR, DWORD)           { return INET_E_DEFAULT_ACTION; }
-    STDMETHOD(QueryInfo)(LPCWSTR, QUERYOPTION, DWORD, LPVOID, DWORD,
-                         DWORD*, DWORD)                      { return INET_E_DEFAULT_ACTION; }
-
     // IWinInetHttpInfo - IE's download code reads the response headers here.
     STDMETHOD(QueryOption)(DWORD, LPVOID, DWORD*)            { return E_NOTIMPL; }
     STDMETHOD(QueryInfo)(DWORD dwOption, LPVOID pBuffer, DWORD* pcbBuf,
@@ -462,6 +425,32 @@ private:
     void ReportHeaders(IInternetProtocolSink* sink, const BYTE* sniff, DWORD cbSniff);
     bool FindHeader(const char* name, const char** pv, DWORD* pn) const;
     void KillCurl() { if (m_hProcess) TerminateProcess(m_hProcess, 1); }
+
+    // The sink to call ReportResult on, or NULL when another path already
+    // has (or the bind was aborted, unless evenIfAborted).  Only one caller
+    // ever gets a sink.  *pHr receives m_hrResult when non-NULL.
+    CComPtr<IInternetProtocolSink> ClaimResult(bool evenIfAborted, HRESULT* pHr = NULL)
+    {
+        CComPtr<IInternetProtocolSink> sink;
+        Lock();
+        if (!m_bResultReported && (evenIfAborted || !m_bAbort))
+        {
+            m_bResultReported = true;
+            sink = m_sink;
+        }
+        if (pHr) *pHr = m_hrResult;
+        Unlock();
+        return sink;
+    }
+
+    // Call with Lock() held.  Marks a Continue as pending and returns the
+    // sink to Switch on, or NULL if one is already queued.
+    CComPtr<IInternetProtocolSink> TakeNotifyLocked()
+    {
+        CComPtr<IInternetProtocolSink> sink;
+        if (!m_bNotifyPending) { m_bNotifyPending = true; sink = m_sink; }
+        return sink;
+    }
 
     CComPtr<IInternetProtocolSink> m_sink;
     CComBSTR                       m_url;
@@ -551,10 +540,9 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
             const char* s = p + 5;
             while (s < lineEnd && *s != ' ') ++s;
             while (s < lineEnd && *s == ' ') ++s;
-            DWORD code = 0;
-            while (s < lineEnd && *s >= '0' && *s <= '9')
-                code = code * 10 + (DWORD)(*s++ - '0');
-            if (code) m_status = code;
+            ULONGLONG code = 0;
+            if (ParseDecimal(s, lineEnd, &code) && code)
+                m_status = (DWORD)code;
         }
         else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10))
         {
@@ -585,9 +573,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
         {
             ULONGLONG len = 0;
             const char* s = v;
-            while (s < lineEnd && *s >= '0' && *s <= '9')
-                len = len * 10 + (ULONGLONG)(*s++ - '0');
-            if (s > v) m_contentLength = len;
+            if (ParseDecimal(s, lineEnd, &len)) m_contentLength = len;
         }
         else if (MatchHdr(p, lineLen, lineEnd, "Content-Encoding", 16))
         {
@@ -751,8 +737,7 @@ bool CurlProtocol::Deliver(const BYTE* p, DWORD n)
         return false;
     }
     m_received += n;
-    CComPtr<IInternetProtocolSink> sink;
-    if (!m_bNotifyPending) { m_bNotifyPending = true; sink = m_sink; }
+    CComPtr<IInternetProtocolSink> sink = TakeNotifyLocked();
     Unlock();
     if (sink) SwitchTo(sink);
     return true;
@@ -788,15 +773,15 @@ void CurlProtocol::Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrByt
     {
         // Register the file under the real URL so IE owns and evicts it.
         int cch = 0;
-        WCHAR* pszHeaders = AnsiToWide(m_rawHeaders, &cch);
+        WCHAR* pszHeaders = MultiByteToWideAlloc(CP_ACP, (const char*)m_rawHeaders.data,
+                                                 (int)m_rawHeaders.size, &cch);
         FILETIME zero = { 0, 0 };
         CommitUrlCacheEntryW(m_url, m_szCache, zero, zero, NORMAL_CACHE_ENTRY,
                              pszHeaders, pszHeaders ? (DWORD)cch : 0, NULL, NULL);
         if (pszHeaders) LocalFree(pszHeaders);
     }
     m_bDone = true;
-    CComPtr<IInternetProtocolSink> sink;
-    if (!m_bNotifyPending) { m_bNotifyPending = true; sink = m_sink; }
+    CComPtr<IInternetProtocolSink> sink = TakeNotifyLocked();
     Unlock();
     if (sink) SwitchTo(sink);
 }
@@ -835,7 +820,7 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
     // One pass per redirect hop.  A document navigation reports the redirect
     // to URLMon.  A download bind (BINDF_NEEDFILE) does not follow that
     // result, so those hops are fetched here.
-    for (int nHop = 0; nHop < 5 && !redirected && !haveHeaders; ++nHop)
+    for (int nHop = 0; nHop < kMaxHops && !redirected && !haveHeaders; ++nHop)
     {
         self->Lock();
         const bool aborted = self->m_bAbort;
@@ -918,7 +903,7 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
                 (st == 301 || st == 302 || st == 303 || st == 307) &&
                 SUCCEEDED(UrlCombineW(hop, szLocation, szTarget, &cchTarget, 0)))
             {
-                if (self->m_needFile && nHop + 1 < 5)
+                if (self->m_needFile && nHop + 1 < kMaxHops)
                 {
                     if (st != 307) asGet = true;
                     lstrcpynW(hop, szTarget, _countof(hop));
@@ -926,12 +911,8 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
                 }
                 else
                 {
-                    self->Lock();
-                    const bool claim = !self->m_bAbort && !self->m_bResultReported;
-                    self->m_bResultReported = true;
-                    CComPtr<IInternetProtocolSink> sink = self->m_sink;
-                    self->Unlock();
-                    if (claim && sink)
+                    CComPtr<IInternetProtocolSink> sink = self->ClaimResult(false);
+                    if (sink)
                     {
                         sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
                         sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
@@ -990,11 +971,9 @@ STDMETHODIMP CurlProtocol::Abort(HRESULT hrReason, DWORD)
     KillCurl();
     SetEvent(m_hRoom.Get());
     DiscardCache();
-    const bool claim = !m_bResultReported;
-    m_bResultReported = true;
-    CComPtr<IInternetProtocolSink> sink = m_sink;
     Unlock();
-    if (claim && sink)
+    CComPtr<IInternetProtocolSink> sink = ClaimResult(true);
+    if (sink)
         sink->ReportResult(hrReason, 0, NULL);
     return S_OK;
 }
@@ -1023,35 +1002,10 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     if (!szURL || !pSink)
         return E_POINTER;
 
-    m_sink    = pSink;
-    m_url     = szURL;
-    m_buf.Free();
-    m_bufPos   = 0;
-    m_received = 0;
-    m_isError  = false;
-    m_postData.Free();
-    m_verb.Empty();
-    m_contentType.Empty();
-    m_extraHeaders.Empty();
-    m_userAgent.Empty();
-    m_rawHeaders.Free();
-    m_serverContentType.Empty();
-    m_dispositionFilename.Empty();
-    m_isAttachment    = false;
-    m_status          = 200;
-    m_contentLength   = (ULONGLONG)-1;
-    m_hasEncoding     = false;
-    m_hrResult        = S_OK;
-    m_bAbort          = false;
-    m_bHeaders        = false;
-    m_bDone           = false;
-    m_bNotifyPending  = false;
-    m_bResultReported = false;
-    m_bReported       = false;
-    m_bCacheReported  = false;
-    m_needFile        = false;
-    m_szCache[0]      = 0;
-    ResetEvent(m_hRoom.Get());
+    // URLMon calls Start once per protocol object, so every other member
+    // still holds its constructor value.
+    m_sink = pSink;
+    m_url  = szURL;
 
     // Extract verb, Content-Type, extra headers, and POST body from URLMon.
     if (pBindInfo)
@@ -1277,7 +1231,8 @@ STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
         if (m_negotiate && !m_isError)
         {
             int     cch = 0;
-            WCHAR*  pszResp = AnsiToWide(m_rawHeaders, &cch);
+            WCHAR*  pszResp = MultiByteToWideAlloc(CP_ACP, (const char*)m_rawHeaders.data,
+                                                   (int)m_rawHeaders.size, &cch);
             LPWSTR  pszReqAdd = NULL;
             HRESULT hr = m_negotiate->OnResponse(m_status, pszResp, NULL, &pszReqAdd);
             if (pszReqAdd) CoTaskMemFree(pszReqAdd);
@@ -1305,13 +1260,10 @@ STDMETHODIMP CurlProtocol::Continue(PROTOCOLDATA*)
 
     if (done)
     {
-        Lock();
-        const bool    claim = !m_bResultReported && !m_bAbort;
-        const HRESULT hr    = m_hrResult;
-        m_bResultReported = true;
-        Unlock();
-        if (claim)
-            sink->ReportResult(hr, m_status, NULL);
+        HRESULT hr = S_OK;
+        CComPtr<IInternetProtocolSink> resultSink = ClaimResult(false, &hr);
+        if (resultSink)
+            resultSink->ReportResult(hr, m_status, NULL);
     }
     return S_OK;
 }
@@ -1440,10 +1392,10 @@ STDMETHODIMP CurlProtocol::QueryInfo(DWORD dwOption, LPVOID pBuffer, DWORD* pcbB
             SetLastError(ERROR_INSUFFICIENT_BUFFER);
             return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
         }
-        DWORD d = 0;
-        for (DWORD i = 0; i < n && v[i] >= '0' && v[i] <= '9'; ++i)
-            d = d * 10 + (DWORD)(v[i] - '0');
-        *(DWORD*)pBuffer = d;
+        ULONGLONG d = 0;
+        const char* s = v;
+        ParseDecimal(s, v + n, &d);
+        *(DWORD*)pBuffer = (DWORD)d;
         *pcbBuf = sizeof(DWORD);
         return S_OK;
     }
