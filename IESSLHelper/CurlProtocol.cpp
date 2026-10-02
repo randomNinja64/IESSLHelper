@@ -68,6 +68,60 @@ static const char* MatchHdr(const char* lineStart, DWORD lineLen,
     return v;
 }
 
+// curl --compressed has already decoded the body, so these headers describe
+// bytes the caller will never see.
+static bool IsEncodedSizeHeader(const char* line, DWORD lineLen, const char* lineEnd)
+{
+    return MatchHdr(line, lineLen, lineEnd, "Content-Encoding", 16)
+        || MatchHdr(line, lineLen, lineEnd, "Transfer-Encoding", 17)
+        || MatchHdr(line, lineLen, lineEnd, "Content-Length", 14);
+}
+
+static void DropEncodedSizeLines(Bytes& raw)
+{
+    Bytes kept;
+    const char* p    = (const char*)raw.data;
+    const char* pEnd = p + raw.size;
+    while (p < pEnd)
+    {
+        const char* lineEnd = p;
+        while (lineEnd < pEnd && *lineEnd != '\r' && *lineEnd != '\n')
+            ++lineEnd;
+        DWORD lineLen = (DWORD)(lineEnd - p);
+        if (lineLen && !IsEncodedSizeHeader(p, lineLen, lineEnd))
+        {
+            kept.Append(p, lineLen);
+            kept.AppendStr("\r\n");
+        }
+        p = lineEnd;
+        if (p < pEnd && *p == '\r') ++p;
+        if (p < pEnd && *p == '\n') ++p;
+    }
+    kept.AppendStr("\r\n");
+    raw.Free();
+    raw.Append(kept.data, kept.size);
+}
+
+// Puts "Content-Length: n" in front of the trailing blank line.
+static void AppendDecodedContentLength(Bytes& raw, ULONGLONG n)
+{
+    if (raw.size >= 2 && raw.data[raw.size - 2] == '\r' && raw.data[raw.size - 1] == '\n')
+        raw.size -= 2;
+    raw.AppendStr("Content-Length: ");
+    char rev[24];
+    int nr = 0;
+    do
+    {
+        rev[nr++] = (char)('0' + (char)(n % 10));
+        n /= 10;
+    } while (n && nr < (int)sizeof(rev));
+    char digits[24];
+    for (int i = 0; i < nr; ++i)
+        digits[i] = rev[nr - 1 - i];
+    raw.Append(digits, (DWORD)nr);
+    raw.AppendStr("\r\n\r\n");
+}
+
 // Netscape cookie lines for the cookies WinInet would send for pszURL.
 // curl reads these from a named pipe, so nothing is written to disk.
 // Empty when there are none.
@@ -415,6 +469,7 @@ private:
     static DWORD WINAPI WorkerProc(LPVOID p);
     void ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
                       WCHAR* szLocation, DWORD cchLocation);
+    void DropEncodedSizeHeaders();
     void ClearHopHeaders();
     void BeginCache();
     void WriteCache(const BYTE* p, DWORD n);
@@ -589,10 +644,12 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
         if (p < pEnd && *p == '\n') ++p;
     }
     m_rawHeaders.AppendStr("\r\n");
+}
 
-    Lock();
-    m_bHeaders = true;
-    Unlock();
+void CurlProtocol::DropEncodedSizeHeaders()
+{
+    DropEncodedSizeLines(m_rawHeaders);
+    m_contentLength = (ULONGLONG)-1;
 }
 
 void CurlProtocol::ClearHopHeaders()
@@ -771,6 +828,10 @@ void CurlProtocol::Finish(DWORD dwExit, bool haveHeaders, const Bytes& stderrByt
     }
     else if (m_szCache[0])
     {
+        // The file is the decoded body. Replace the compressed length
+        // that DropEncodedSizeHeaders removed.
+        if (m_hasEncoding)
+            AppendDecodedContentLength(m_rawHeaders, m_received);
         // Register the file under the real URL so IE owns and evicts it.
         int cch = 0;
         WCHAR* pszHeaders = MultiByteToWideAlloc(CP_ACP, (const char*)m_rawHeaders.data,
@@ -923,6 +984,14 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
             else
             {
                 haveHeaders = true;
+                // Not a redirect: this block is the one QueryInfo may read.
+                // Drop the encoded size first, so the flag never covers a
+                // buffer we are about to rebuild.
+                if (self->m_hasEncoding)
+                    self->DropEncodedSizeHeaders();
+                self->Lock();
+                self->m_bHeaders = true;
+                self->Unlock();
                 if (self->m_needFile || self->m_isAttachment ||
                     (st >= 200 && st < 300 && !RendersInline(self->m_serverContentType)))
                     self->BeginCache();
