@@ -13,7 +13,8 @@ namespace curlbho {
 
 // Pseudo exit code returned when curl.exe could not even be launched.
 // (defined in the header so it can be used as a case label in other TUs)
-static const DWORD FETCH_LAUNCH_FAILED = 0xFFFFFFFE;
+static const DWORD FETCH_LAUNCH_FAILED    = 0xFFFFFFFE;
+static const DWORD FETCH_HEADERS_TOO_LARGE = 0xFFFFFFFD;
 
 // Parameters passed to StartCurl.
 struct CurlRequest

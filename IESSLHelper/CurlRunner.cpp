@@ -320,7 +320,9 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     ScopedHandle hPipe;
     ScopedHandle hCookiePipe;
 
-    const bool bHasBody = (req.pPostData != NULL && req.cbPostData > 0);
+    // -X HEAD makes curl wait for a body. -I is a header-only request.
+    const bool bHead = req.pszVerb && _wcsicmp(req.pszVerb, L"HEAD") == 0;
+    const bool bHasBody = !bHead && (req.pPostData != NULL && req.cbPostData > 0);
     const bool bHasCookies = (req.pCookieJar != NULL && req.cbCookieJar > 0);
 
     if (bHasCookies)
@@ -369,10 +371,12 @@ bool StartCurl(const CurlRequest& req, CurlProcess* proc)
     if (bCmd && bHasCookies)
         bCmd = AppendArg(szCmd, &cch, L" -b \"%s\"", szCookiePipe);
 
-    // Verb (-X POST / -X PUT / etc.)
-    const bool bCustomVerb = VerbIsAlpha(req.pszVerb) &&
+    // Verb (-I for HEAD, -X POST / -X PUT / etc. otherwise)
+    const bool bCustomVerb = !bHead && VerbIsAlpha(req.pszVerb) &&
                              _wcsicmp(req.pszVerb, L"GET") != 0;
-    if (bCmd && bCustomVerb)
+    if (bCmd && bHead)
+        bCmd = AppendArg(szCmd, &cch, L" %s", L"-I");
+    else if (bCmd && bCustomVerb)
         bCmd = AppendArg(szCmd, &cch, L" -X %s", req.pszVerb);
 
     if (bCmd && req.pszContentType && req.pszContentType[0])

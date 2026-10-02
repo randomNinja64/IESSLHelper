@@ -25,6 +25,9 @@ void BuildErrorPage(Bytes& out, LPCWSTR pszURL, DWORD dwExit,
             pszMsg = L"Failed to launch curl.exe. Make sure it exists next to "
                      L"the BHO DLL or is on PATH.";
             break;
+        case FETCH_HEADERS_TOO_LARGE:
+            pszMsg = L"The response headers were larger than 1 MB.";
+            break;
         default:
             wsprintfW(szMsg,
                 L"curl exited with code %u. See the details below for the "

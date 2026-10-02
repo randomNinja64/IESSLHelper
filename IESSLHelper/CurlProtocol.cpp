@@ -3,6 +3,7 @@
 #include "CurlRunner.h"
 #include "ErrorPage.h"
 #include "Util.h"
+#include <process.h>
 #include <wininet.h>
 
 // ===========================================================================
@@ -66,6 +67,12 @@ static const char* MatchHdr(const char* lineStart, DWORD lineLen,
     const char* v = lineStart + nameLen + 1;
     while (v < lineEnd && (*v == ' ' || *v == '\t')) ++v;
     return v;
+}
+
+static bool StartsWithI(const char* p, DWORD rem, const char* lit)
+{
+    const DWORD n = lstrlenA(lit);
+    return rem >= n && _strnicmp(p, lit, n) == 0;
 }
 
 // curl --compressed has already decoded the body, so these headers describe
@@ -466,7 +473,11 @@ public:
                          DWORD* pdwFlags, DWORD* pdwReserved);
 
 private:
-    static DWORD WINAPI WorkerProc(LPVOID p);
+    enum HopOutcome { kHopFollow, kHopRedirected, kHopStop };
+
+    static unsigned __stdcall WorkerProc(void* p);
+    HopOutcome FetchOneHop(WCHAR* hop, int nHop, bool* asGet,
+                           Bytes& stderrBytes, DWORD* pdwExit, bool* pHaveHeaders);
     void ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
                       WCHAR* szLocation, DWORD cchLocation);
     void DropEncodedSizeHeaders();
@@ -561,6 +572,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
         while (lineEnd < pEnd && *lineEnd != '\r' && *lineEnd != '\n')
             ++lineEnd;
         DWORD lineLen = (DWORD)(lineEnd - p);
+        const char* v = NULL;
         if (lineLen)
         {
             // IE6 refuses to save an HTTPS download when these say
@@ -568,7 +580,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
             const char* store = p;
             DWORD storeLen = lineLen;
             char repl[40];
-            if (const char* v = MatchHdr(p, lineLen, lineEnd, "Cache-Control", 13))
+            if ((v = MatchHdr(p, lineLen, lineEnd, "Cache-Control", 13)) != NULL)
             {
                 DWORD vn = (DWORD)(lineEnd - v);
                 if (ContainsToken(v, vn, "no-cache") || ContainsToken(v, vn, "no-store"))
@@ -578,7 +590,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
                     storeLen = lstrlenA(repl);
                 }
             }
-            else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Pragma", 6))
+            else if ((v = MatchHdr(p, lineLen, lineEnd, "Pragma", 6)) != NULL)
             {
                 if (ContainsToken(v, (DWORD)(lineEnd - v), "no-cache"))
                     storeLen = 0;
@@ -599,17 +611,17 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
             if (ParseDecimal(s, lineEnd, &code) && code)
                 m_status = (DWORD)code;
         }
-        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10))
+        else if ((v = MatchHdr(p, lineLen, lineEnd, "Set-Cookie", 10)) != NULL)
         {
             StoreSetCookie(pszPage, v, (DWORD)(lineEnd - v));
         }
-        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Location", 8))
+        else if ((v = MatchHdr(p, lineLen, lineEnd, "Location", 8)) != NULL)
         {
             int wlen = MultiByteToWideChar(CP_UTF8, 0, v, (int)(lineEnd - v),
                                           szLocation, cchLocation - 1);
             szLocation[wlen > 0 ? wlen : 0] = 0;
         }
-        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12))
+        else if ((v = MatchHdr(p, lineLen, lineEnd, "Content-Type", 12)) != NULL)
         {
             DWORD vlen = (DWORD)(lineEnd - v);
             // Strip any "; charset=..." parameters for the MIME.
@@ -624,7 +636,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
                 if (wlen > 0) { wbuf[wlen] = 0; m_serverContentType = wbuf; }
             }
         }
-        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Length", 14))
+        else if ((v = MatchHdr(p, lineLen, lineEnd, "Content-Length", 14)) != NULL)
         {
             ULONGLONG len = 0;
             const char* s = v;
@@ -634,7 +646,7 @@ void CurlProtocol::ParseHeaders(const char* block, DWORD cb, LPCWSTR pszPage,
         {
             m_hasEncoding = true;
         }
-        else if (const char* v = MatchHdr(p, lineLen, lineEnd, "Content-Disposition", 19))
+        else if ((v = MatchHdr(p, lineLen, lineEnd, "Content-Disposition", 19)) != NULL)
         {
             ParseDisposition(v, (DWORD)(lineEnd - v),
                              &m_isAttachment, m_dispositionFilename);
@@ -781,6 +793,12 @@ bool CurlProtocol::Deliver(const BYTE* p, DWORD n)
 {
     WriteCache(p, n);
     Lock();
+    if (!m_hRoom.Valid())
+    {
+        m_hrResult = E_OUTOFMEMORY;
+        Unlock();
+        return false;
+    }
     while (!m_bAbort && m_buf.size - m_bufPos >= kMaxQueued)
     {
         Unlock();
@@ -855,7 +873,7 @@ struct StderrRead
     Bytes* out;
 };
 
-static DWORD WINAPI StderrReadProc(LPVOID p)
+static unsigned __stdcall StderrReadProc(void* p)
 {
     StderrRead* r = static_cast<StderrRead*>(p);
     BYTE buf[4096];
@@ -865,9 +883,157 @@ static DWORD WINAPI StderrReadProc(LPVOID p)
     return 0;
 }
 
-DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
+CurlProtocol::HopOutcome CurlProtocol::FetchOneHop(WCHAR* hop, int nHop, bool* asGet,
+                                                       Bytes& stderrBytes, DWORD* pdwExit,
+                                                       bool* pHaveHeaders)
+{
+    Bytes cookieJar;
+    BuildCookieJar(hop, cookieJar);
+
+    CurlRequest req;
+    ZeroMemory(&req, sizeof(req));
+    req.pszURL          = hop;
+    req.pCookieJar      = cookieJar.size ? cookieJar.data : NULL;
+    req.cbCookieJar     = cookieJar.size;
+    req.pszExtraHeaders = m_extraHeaders.Length() > 0 ? (LPCWSTR)m_extraHeaders : NULL;
+    req.pszUserAgent    = m_userAgent.Length() > 0 ? (LPCWSTR)m_userAgent : NULL;
+    if (!*asGet)
+    {
+        req.pszVerb        = m_verb.Length()        > 0 ? (LPCWSTR)m_verb        : NULL;
+        req.pszContentType = m_contentType.Length() > 0 ? (LPCWSTR)m_contentType : NULL;
+        req.pPostData      = m_postData.data;
+        req.cbPostData     = m_postData.size;
+    }
+
+    CurlProcess proc;
+    if (!curlbho::StartCurl(req, &proc))
+        return kHopStop;
+
+    Lock();
+    m_hProcess = proc.hProcess;
+    if (m_bAbort) KillCurl();
+    Unlock();
+
+    stderrBytes.Free();
+    StderrRead errRead;
+    errRead.hErr = proc.hErr;
+    errRead.out  = &stderrBytes;
+    HANDLE hErrThread = (HANDLE)_beginthreadex(NULL, 0, StderrReadProc, &errRead, 0, NULL);
+    if (!hErrThread && proc.hErr != INVALID_HANDLE_VALUE)
+    {
+        // Losing the error text is better than a full pipe stalling curl.
+        CloseHandle(proc.hErr);
+        proc.hErr = INVALID_HANDLE_VALUE;
+    }
+
+    Bytes head;
+    bool  stop    = false;
+    bool  follow  = false;
+    bool  tooBig  = false;
+    bool  toldUrlMon = false;
+    BYTE  buf[65536];
+    DWORD cbRead = 0;
+    while (!stop && ReadFile(proc.hOut, buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
+    {
+        if (*pHaveHeaders)
+        {
+            stop = !Deliver(buf, cbRead);
+            continue;
+        }
+        if (!head.Append(buf, cbRead) || head.size > kMaxHeaderBytes)
+        {
+            tooBig = stop = true;
+            continue;
+        }
+        DWORD start = 0, body = 0;
+        if (!FindHeaderBlock(head, &start, &body))
+            continue;
+
+        WCHAR szLocation[INTERNET_MAX_URL_LENGTH] = L"";
+        ParseHeaders((const char*)head.data + start, body - start,
+                     hop, szLocation, _countof(szLocation));
+
+        // These are the codes IE6 follows.  Set-Cookie was stored above
+        // so the next hop sees it.
+        const DWORD st = m_status;
+        WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
+        DWORD cchTarget = _countof(szTarget);
+        if (szLocation[0] &&
+            (st == 301 || st == 302 || st == 303 || st == 307) &&
+            SUCCEEDED(UrlCombineW(hop, szLocation, szTarget, &cchTarget, 0)))
+        {
+            if (m_needFile && nHop + 1 < kMaxHops)
+            {
+                if (st != 307) *asGet = true;
+                lstrcpynW(hop, szTarget, INTERNET_MAX_URL_LENGTH);
+                follow = stop = true;
+            }
+            else
+            {
+                CComPtr<IInternetProtocolSink> sink = ClaimResult(false);
+                if (sink)
+                {
+                    sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
+                    sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
+                }
+                toldUrlMon = stop = true;
+            }
+        }
+        else
+        {
+            *pHaveHeaders = true;
+            // Not a redirect: this block is the one QueryInfo may read.
+            // Drop the encoded size first, so the flag never covers a
+            // buffer we are about to rebuild.
+            if (m_hasEncoding)
+                DropEncodedSizeHeaders();
+            Lock();
+            m_bHeaders = true;
+            Unlock();
+            if (m_needFile || m_isAttachment ||
+                (st >= 200 && st < 300 && !RendersInline(m_serverContentType)))
+                BeginCache();
+            if (body < head.size)
+                stop = !Deliver(head.data + body, head.size - body);
+        }
+        head.Free();
+    }
+
+    Lock();
+    if (stop) KillCurl();
+    m_hProcess = NULL;
+    Unlock();
+
+    // Kill first when the body was abandoned, so this wait cannot sit
+    // behind a curl that is blocked on a full stdout pipe.
+    if (hErrThread)
+    {
+        WaitForSingleObject(hErrThread, INFINITE);
+        CloseHandle(hErrThread);
+    }
+
+    if (follow)
+    {
+        stderrBytes.Free();
+        curlbho::FinishCurl(&proc);
+        ClearHopHeaders();
+        return kHopFollow;
+    }
+
+    const DWORD dwExit = curlbho::FinishCurl(&proc);
+    *pdwExit = tooBig ? curlbho::FETCH_HEADERS_TOO_LARGE : dwExit;
+    return toldUrlMon ? kHopRedirected : kHopStop;
+}
+
+unsigned __stdcall CurlProtocol::WorkerProc(void* p)
 {
     CurlProtocol* self = static_cast<CurlProtocol*>(p);
+
+    // Held until this thread has left DLL code. Release() below can drop
+    // the last reference while we are still in this function.
+    HMODULE hMod = NULL;
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+                       (LPCWSTR)(void*)CurlProtocol::WorkerProc, &hMod);
 
     WCHAR hop[INTERNET_MAX_URL_LENGTH];
     lstrcpynW(hop, self->m_url, _countof(hop));
@@ -889,140 +1055,11 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         if (aborted)
             break;
 
-        Bytes cookieJar;
-        BuildCookieJar(hop, cookieJar);
-
-        CurlRequest req;
-        ZeroMemory(&req, sizeof(req));
-        req.pszURL          = hop;
-        req.pCookieJar      = cookieJar.size ? cookieJar.data : NULL;
-        req.cbCookieJar     = cookieJar.size;
-        req.pszExtraHeaders = self->m_extraHeaders.Length() > 0
-                              ? (LPCWSTR)self->m_extraHeaders : NULL;
-        req.pszUserAgent    = self->m_userAgent.Length() > 0
-                              ? (LPCWSTR)self->m_userAgent : NULL;
-        if (!asGet)
-        {
-            req.pszVerb        = self->m_verb.Length()        > 0 ? (LPCWSTR)self->m_verb        : NULL;
-            req.pszContentType = self->m_contentType.Length() > 0 ? (LPCWSTR)self->m_contentType : NULL;
-            req.pPostData      = self->m_postData.data;
-            req.cbPostData     = self->m_postData.size;
-        }
-
-        CurlProcess proc;
-        if (!curlbho::StartCurl(req, &proc))
-            break;
-
-        self->Lock();
-        self->m_hProcess = proc.hProcess;
-        if (self->m_bAbort) self->KillCurl();
-        self->Unlock();
-
-        stderrBytes.Free();
-        StderrRead errRead;
-        errRead.hErr = proc.hErr;
-        errRead.out  = &stderrBytes;
-        HANDLE hErrThread = CreateThread(NULL, 0, StderrReadProc, &errRead, 0, NULL);
-        if (!hErrThread && proc.hErr != INVALID_HANDLE_VALUE)
-        {
-            // Losing the error text is better than a full pipe stalling curl.
-            CloseHandle(proc.hErr);
-            proc.hErr = INVALID_HANDLE_VALUE;
-        }
-
-        Bytes head;
-        bool  stop   = false;
-        bool  follow = false;
-        BYTE  buf[65536];
-        DWORD cbRead = 0;
-        while (!stop && ReadFile(proc.hOut, buf, sizeof(buf), &cbRead, NULL) && cbRead > 0)
-        {
-            if (haveHeaders)
-            {
-                stop = !self->Deliver(buf, cbRead);
-                continue;
-            }
-            if (!head.Append(buf, cbRead) || head.size > kMaxHeaderBytes)
-            {
-                stop = true;
-                continue;
-            }
-            DWORD start = 0, body = 0;
-            if (!FindHeaderBlock(head, &start, &body))
-                continue;
-
-            WCHAR szLocation[INTERNET_MAX_URL_LENGTH] = L"";
-            self->ParseHeaders((const char*)head.data + start, body - start,
-                               hop, szLocation, _countof(szLocation));
-
-            // These are the codes IE6 follows.  Set-Cookie was stored above
-            // so the next hop sees it.
-            const DWORD st = self->m_status;
-            WCHAR szTarget[INTERNET_MAX_URL_LENGTH];
-            DWORD cchTarget = _countof(szTarget);
-            if (szLocation[0] &&
-                (st == 301 || st == 302 || st == 303 || st == 307) &&
-                SUCCEEDED(UrlCombineW(hop, szLocation, szTarget, &cchTarget, 0)))
-            {
-                if (self->m_needFile && nHop + 1 < kMaxHops)
-                {
-                    if (st != 307) asGet = true;
-                    lstrcpynW(hop, szTarget, _countof(hop));
-                    follow = stop = true;
-                }
-                else
-                {
-                    CComPtr<IInternetProtocolSink> sink = self->ClaimResult(false);
-                    if (sink)
-                    {
-                        sink->ReportProgress(BINDSTATUS_REDIRECTING, szTarget);
-                        sink->ReportResult(INET_E_REDIRECTING, 0, szTarget);
-                    }
-                    redirected = stop = true;
-                }
-            }
-            else
-            {
-                haveHeaders = true;
-                // Not a redirect: this block is the one QueryInfo may read.
-                // Drop the encoded size first, so the flag never covers a
-                // buffer we are about to rebuild.
-                if (self->m_hasEncoding)
-                    self->DropEncodedSizeHeaders();
-                self->Lock();
-                self->m_bHeaders = true;
-                self->Unlock();
-                if (self->m_needFile || self->m_isAttachment ||
-                    (st >= 200 && st < 300 && !RendersInline(self->m_serverContentType)))
-                    self->BeginCache();
-                if (body < head.size)
-                    stop = !self->Deliver(head.data + body, head.size - body);
-            }
-            head.Free();
-        }
-
-        self->Lock();
-        if (stop) self->KillCurl();
-        self->m_hProcess = NULL;
-        self->Unlock();
-
-        // Kill first when the body was abandoned, so this wait cannot sit
-        // behind a curl that is blocked on a full stdout pipe.
-        if (hErrThread)
-        {
-            WaitForSingleObject(hErrThread, INFINITE);
-            CloseHandle(hErrThread);
-        }
-
-        if (follow)
-        {
-            stderrBytes.Free();
-            curlbho::FinishCurl(&proc);
-            self->ClearHopHeaders();
+        const HopOutcome outcome = self->FetchOneHop(hop, nHop, &asGet, stderrBytes,
+                                                     &dwExit, &haveHeaders);
+        if (outcome == kHopFollow)
             continue;
-        }
-
-        dwExit = curlbho::FinishCurl(&proc);
+        redirected = (outcome == kHopRedirected);
         break;
     }
 
@@ -1030,6 +1067,10 @@ DWORD WINAPI CurlProtocol::WorkerProc(LPVOID p)
         self->Finish(dwExit, haveHeaders, stderrBytes);
 
     self->Release();      // matches AddRef in Start
+    // Does not run the CRT thread cleanup: one per-thread block leaks per
+    // request, which is the cost of not returning into an unloaded DLL.
+    if (hMod)
+        FreeLibraryAndExitThread(hMod, 0);
     return 0;
 }
 
@@ -1070,6 +1111,8 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
 {
     if (!szURL || !pSink)
         return E_POINTER;
+    if (!m_hRoom.Valid())
+        return E_OUTOFMEMORY;
 
     // URLMon calls Start once per protocol object, so every other member
     // still holds its constructor value.
@@ -1182,8 +1225,8 @@ STDMETHODIMP CurlProtocol::Start(LPCWSTR szURL, IInternetProtocolSink* pSink,
     }
 
     AddRef();   // hold a ref for the worker
-    HANDLE hThread = CreateThread(NULL, 0, &CurlProtocol::WorkerProc,
-                                  this, 0, NULL);
+    HANDLE hThread = (HANDLE)_beginthreadex(NULL, 0, &CurlProtocol::WorkerProc,
+                                            this, 0, NULL);
     if (!hThread)
     {
         Release();
@@ -1228,16 +1271,14 @@ void CurlProtocol::ReportHeaders(IInternetProtocolSink* sink,
         {
             if (p[i] != '<') continue;
             DWORD rem = cbSniff - i;
-            #define _MATCHI(s) (rem >= sizeof(s)-1 && _strnicmp(p+i, s, sizeof(s)-1) == 0)
-            if (_MATCHI("<!doctype") || _MATCHI("<html") ||
-                _MATCHI("<head")     || _MATCHI("<body") ||
-                _MATCHI("<script")   || _MATCHI("<title") ||
-                _MATCHI("<meta")     || _MATCHI("<!--"))
+            if (StartsWithI(p + i, rem, "<!doctype") || StartsWithI(p + i, rem, "<html") ||
+                StartsWithI(p + i, rem, "<head")     || StartsWithI(p + i, rem, "<body") ||
+                StartsWithI(p + i, rem, "<script")   || StartsWithI(p + i, rem, "<title") ||
+                StartsWithI(p + i, rem, "<meta")     || StartsWithI(p + i, rem, "<!--"))
             {
                 looksLikeHtml = true;
                 break;
             }
-            #undef _MATCHI
         }
 
         if (!looksLikeHtml && cbSniff > 0)
